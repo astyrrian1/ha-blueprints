@@ -1,14 +1,12 @@
 blueprint:
-  name: 'System: Individual Battery Tasks'
-  description: 'Scans for low batteries and creates **one task per device**.
-
-    Features: - **Per-Device Tasks**: Creates distinct items (e.g., "Replace Battery:
-    Kitchen", "Replace Battery: Hallway"). - **Smart De-Duplication**: Checks if "Replace
-    Battery: [Name]" exists. Ignores percentage changes to prevent duplicates. - **Summary
-    Notification**: Sends one notification summarizing all added items with their
-    percentages.
-
-    '
+  name: 'System: Individual Battery Tasks V2 (Smart)'
+  description: >-
+    Scans for low batteries and creates one task per device.
+    * **Per-Device Tasks:** Creates distinct items (e.g., "Replace Battery: Kitchen").
+    * **Smart De-Dupe:** Only checks `needs_action` tasks (not completed) to allow re-creation.
+    * **Auto-Close:** Completed tasks when battery recovers above threshold.
+    * **Anchored Regex:** Strips "Battery Level" or "Battery" from end of names only.
+    * **Smart Notify:** Only sends notification when new tasks were actually created.
   domain: automation
   input:
     trigger_time:
@@ -57,55 +55,112 @@ variables:
   exclude: !input exclude_sensors
   target_todo: !input todo_list
   notify_devs: !input notify_devices
-  low_battery_entities: "{% set result = namespace(entities=[]) %} {% for state in
-    states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class',
-    'eq', 'battery') %}\n  {% if state.entity_id not in exclude and state.state |
-    is_number and state.state | float <= threshold | float %}\n    {% set result.entities
-    = result.entities + [state.entity_id] %}\n  {% endif %}\n{% endfor %} {{ result.entities
-    }}"
+  low_battery_entities: >-
+    {% set result = namespace(entities=[]) %}
+    {% for state in states.sensor
+       | selectattr('attributes.device_class', 'defined')
+       | selectattr('attributes.device_class', 'eq', 'battery') %}
+      {% if state.entity_id not in exclude
+         and state.state | is_number
+         and state.state | float <= threshold | float %}
+        {% set result.entities = result.entities + [state.entity_id] %}
+      {% endif %}
+    {% endfor %}
+    {{ result.entities }}
 trigger:
 - platform: time
   at: !input trigger_time
-condition:
-- condition: template
-  value_template: '{{ low_battery_entities | count > 0 }}'
 action:
 - action: todo.get_items
   target:
     entity_id: !input todo_list
   response_variable: current_todo_items
+# --- Phase 1: Create tasks for low batteries (only if no active task exists) ---
+- variables:
+    created_tasks: []
 - repeat:
     for_each: '{{ low_battery_entities }}'
     sequence:
     - variables:
-        sensor_name: '{{ state_attr(repeat.item, ''friendly_name'') | replace('' Battery
-          Level'', '''') | replace('' Battery'', '''') }}'
+        sensor_name: >-
+          {{ state_attr(repeat.item, 'friendly_name')
+             | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='')
+             | trim }}
         task_title: 'Replace Battery: {{ sensor_name }}'
-        existing_titles: '{{ current_todo_items[target_todo][''items''] | map(attribute=''summary'')
-          | list }}'
+        # Only check needs_action tasks — allows re-creation after a completed task ages out
+        active_exists: >-
+          {{ current_todo_items[target_todo]['items']
+             | selectattr('summary', 'eq', task_title)
+             | selectattr('status', 'eq', 'needs_action')
+             | list | length > 0 }}
     - if:
       - condition: template
-        value_template: '{{ task_title not in existing_titles }}'
+        value_template: '{{ not active_exists }}'
       then:
       - action: todo.add_item
         target:
           entity_id: !input todo_list
         data:
           item: '{{ task_title }}'
+      - variables:
+          created_tasks: '{{ created_tasks + [sensor_name ~ '' ('' ~ states(repeat.item) ~ ''%)''] }}'
+# --- Phase 2: Auto-close tasks for batteries that recovered ---
 - variables:
-    summary_text: "{% set result = namespace(text=[]) %} {% for entity_id in low_battery_entities
-      %}\n   {% set name = state_attr(entity_id, 'friendly_name') | replace(' Battery
-      Level', '') %}\n   {% set level = states(entity_id) %}\n   {% set result.text
-      = result.text + [name ~ ' (' ~ level ~ '%)'] %}\n{% endfor %} {{ result.text
-      | join(', ') }}"
+    open_battery_tasks: >-
+      {{ current_todo_items[target_todo]['items']
+         | selectattr('status', 'eq', 'needs_action')
+         | selectattr('summary', 'match', '^Replace Battery:')
+         | list }}
+    all_battery_ids: >-
+      {{ states.sensor
+         | selectattr('attributes.device_class', 'defined')
+         | selectattr('attributes.device_class', 'eq', 'battery')
+         | map(attribute='entity_id') | list }}
 - repeat:
-    for_each: '{{ notify_devs }}'
+    for_each: '{{ open_battery_tasks }}'
     sequence:
-    - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
-      data:
-        title: "\U0001FAAB Low Batteries Detected"
-        message: 'Tasks added for: {{ summary_text }}'
+    - variables:
+        task_dev_name: '{{ repeat.item.summary | replace(''Replace Battery: '', '''') }}'
+        matching_entity: >-
+          {% set result = namespace(eid='') %}
+          {% for eid in all_battery_ids %}
+            {% if eid not in exclude %}
+              {% set rn = state_attr(eid, 'friendly_name') %}
+              {% set dn = rn | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='') | trim %}
+              {% if dn == task_dev_name %}
+                {% set result.eid = eid %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ result.eid }}
+        is_healthy: >-
+          {% if matching_entity | length > 0 %}
+            {% set val = states(matching_entity) %}
+            {{ val not in ['unavailable', 'unknown'] and val | is_number and val | float > threshold | float }}
+          {% else %}
+            false
+          {% endif %}
+    - if: '{{ is_healthy }}'
+      then:
+      - action: todo.update_item
+        target:
+          entity_id: !input todo_list
         data:
-          tag: battery_monitor
-          url: /todo
-          clickAction: /todo
+          item: '{{ repeat.item.uid }}'
+          status: completed
+# --- Phase 3: Only notify when new tasks were actually created ---
+- if: '{{ created_tasks | length > 0 }}'
+  then:
+  - variables:
+      summary_text: '{{ created_tasks | join('', '') }}'
+  - repeat:
+      for_each: '{{ notify_devs }}'
+      sequence:
+      - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+        data:
+          title: "\U0001FAAB Low Batteries Detected"
+          message: 'Tasks added for: {{ summary_text }}'
+          data:
+            tag: battery_monitor
+            url: /todo
+            clickAction: /todo

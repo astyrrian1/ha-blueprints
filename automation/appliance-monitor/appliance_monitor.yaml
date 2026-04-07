@@ -1,11 +1,13 @@
 blueprint:
-  name: 'System: Smart Appliance Monitor V13 (Nuclear)'
-  description: 'Nuclear Appliance Management. * **Features:** Finish Sensor + Power
-    Sensor + Blocking Entity. * **Voice:** Configurable Volume + TTS. * **AI Sass:**
-    Generates sassy announcements (with Circuit Breaker). * **Nag:** Repeats alerts
-    every hour if ignored. * **Alerts:** Voice, Mobile, and Signal.
-
-    '
+  name: 'System: Smart Appliance Monitor V14 (Nuclear)'
+  description: >-
+    Nuclear Appliance Management.
+    * **Features:** Finish Sensor + Power Sensor + Blocking Entity.
+    * **Voice:** Configurable Volume + TTS.
+    * **AI Sass:** Generates sassy announcements (with Circuit Breaker).
+    * **Nag:** Repeats alerts every hour if ignored, with early exit if not applicable.
+    * **Gratitude:** Credits the person who emptied the appliance.
+    * **Alerts:** Voice, Mobile, and Signal.
   domain: automation
   input:
     appliance_name:
@@ -79,6 +81,12 @@ blueprint:
           max: 1.0
           step: 0.05
           mode: slider
+    signal_group_target:
+      name: Signal Group Target (Optional)
+      description: Base64-encoded Signal group ID for Signal messenger alerts.
+      default: ''
+      selector:
+        text: {}
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/appliance-monitor/appliance_monitor.yaml
 variables:
   name: !input appliance_name
@@ -90,8 +98,10 @@ variables:
   ai_ent: !input ai_task_entity
   tts_ent: !input tts_engine
   vol: !input announce_volume
+  signal_target: !input signal_group_target
   task_title: Empty {{ name }}
-mode: restart
+mode: queued
+max: 3
 max_exceeded: silent
 trigger:
 - platform: state
@@ -107,27 +117,84 @@ trigger:
   id: nag
 condition: []
 action:
+# --- Early exit for nag trigger when appliance isn't in finished state ---
+- condition: template
+  value_template: >-
+    {% if trigger.id == 'nag' %}
+      {{ is_state(finish_ent, 'on') and is_state(power_ent, 'on') }}
+    {% else %}
+      true
+    {% endif %}
 - action: todo.get_items
   target:
     entity_id: !input todo_list
   response_variable: current_items
+- variables:
+    home_persons: >-
+      {{ states.person | selectattr('state','eq','home')
+         | map(attribute='attributes.friendly_name') | list }}
+    recent_person: >-
+      {% set recent = states.person
+         | selectattr('state','ne','home')
+         | sort(attribute='last_changed', reverse=true)
+         | first | default(none) %}
+      {% if recent is not none and (now() - recent.last_changed).total_seconds() < 600 %}
+        {{ recent.attributes.friendly_name }}
+      {% endif %}
+    worker_name: >-
+      {% if home_persons | length > 0 %}
+        {{ home_persons | join(' and ') }}
+      {% elif recent_person | length > 0 %}
+        {{ recent_person }}
+      {% endif %}
+    has_worker: >-
+      {{ home_persons | length > 0 or recent_person | length > 0 }}
 - choose:
+  # --- Path 1: Appliance emptied (power off) — complete task + gratitude ---
   - conditions:
     - condition: state
       entity_id: !input power_sensor
       state: 'off'
     sequence:
-    - repeat:
-        for_each: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
-          'eq', task_title) \n   | selectattr('status', 'eq', 'needs_action') \n   |
-          map(attribute='uid') | list }}"
-        sequence:
-        - action: todo.update_item
-          target:
-            entity_id: !input todo_list
-          data:
-            item: '{{ repeat.item }}'
-            status: completed
+    - variables:
+        open_task_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_title)
+             | selectattr('status', 'eq', 'needs_action')
+             | map(attribute='uid') | list }}
+    - if: '{{ open_task_uids | length > 0 }}'
+      then:
+      - repeat:
+          for_each: '{{ open_task_uids }}'
+          sequence:
+          - action: todo.update_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ repeat.item }}'
+              status: completed
+      - if: '{{ has_worker }}'
+        then:
+        - repeat:
+            for_each: '{{ notify_devs }}'
+            sequence:
+            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+              data:
+                title: "✅ {{ name }} Emptied!"
+                message: >-
+                  {% set dev = device_attr(repeat.item, 'name') | lower %}
+                  {% if worker_name | lower in dev %}
+                    You emptied the {{ name | lower }}! 🙌
+                  {% else %}
+                    {{ worker_name }} just emptied the {{ name | lower }}! ❤️
+                  {% endif %}
+                data:
+                  tag: gratitude_{{ name | slugify }}
+        - event: gratitude_award
+          event_data:
+            person: '{{ worker_name }}'
+            chore: Emptying {{ name }}
+  # --- Path 2: Appliance finished — create task + announce ---
   - conditions:
     - condition: state
       entity_id: !input finish_sensor
@@ -136,16 +203,24 @@ action:
       entity_id: !input power_sensor
       state: 'on'
     - condition: template
-      value_template: "{% if block_ent != none and block_ent != '' and block_ent !=
-        [] %}\n  {{ is_state(block_ent, 'off') }}\n{% else %}\n  true\n{% endif %}"
+      value_template: >-
+        {% if block_ent is string and block_ent | length > 0 %}
+          {{ is_state(block_ent, 'off') }}
+        {% else %}
+          true
+        {% endif %}
     sequence:
     - variables:
-        open_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
-          'eq', task_title) \n   | selectattr('status', 'eq', 'needs_action') \n   |
-          map(attribute='uid') | list }}"
-        closed_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
-          'eq', task_title) \n   | selectattr('status', 'eq', 'completed') \n   |
-          map(attribute='uid') | list }}"
+        open_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_title)
+             | selectattr('status', 'eq', 'needs_action')
+             | map(attribute='uid') | list }}
+        closed_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_title)
+             | selectattr('status', 'eq', 'completed')
+             | map(attribute='uid') | list }}
         has_open: '{{ open_uids | length > 0 }}'
         has_closed: '{{ closed_uids | length > 0 }}'
     - if: '{{ has_closed and (not has_open) }}'
@@ -168,21 +243,23 @@ action:
       data:
         entity_id: '{{ ai_ent }}'
         task_name: Appliance Finish
-        instructions: 'Persona: Sassy Assistant. Context: The {{ name }} has finished
-          its cycle. Trigger: {{ trigger.id }} (Note: ''nag'' means it''s been sitting
-          there). Task: Announce it needs to be emptied. Tone: If ''nag'', be impatient.
-          If ''finished'', be helpful. Format: Short sentence for TTS.
-
-          '
+        instructions: >-
+          Persona: Sassy Assistant. Context: The {{ name }} has finished
+          its cycle. Trigger: {{ trigger.id }} (Note: 'nag' means it's been sitting
+          there). Task: Announce it needs to be emptied. Tone: If 'nag', be impatient.
+          If 'finished', be helpful. Format: Short sentence for TTS.
         structure:
           spoken_text:
             selector:
               text: {}
       response_variable: ai_speech
     - variables:
-        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
-          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  The {{ name | lower }}
-          is finished. Please empty it.\n{% endif %}"
+        final_speech: >-
+          {% if ai_speech is defined and ai_speech.data is defined %}
+            {{ ai_speech.data.spoken_text }}
+          {% else %}
+            The {{ name | lower }} is finished. Please empty it.
+          {% endif %}
     - action: script.system_smart_voice_broadcast
       data:
         message: '{{ final_speech }}'
@@ -196,8 +273,7 @@ action:
       - repeat:
           for_each: '{{ notify_devs }}'
           sequence:
-          - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
-              }}
+          - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
             data:
               title: '{{ name }} Finished'
               message: '{{ final_speech }}'
@@ -207,11 +283,11 @@ action:
                 priority: high
       - if:
         - condition: template
-          value_template: '{{ ''Downstairs'' in name }}'
+          value_template: '{{ signal_target | length > 0 }}'
         then:
         - action: notify.signal
           data:
             message: '{{ name }} is Finished'
             title: '{{ name }} is Finished'
-            target: group.ZDNJcWhIMG1pUnphMGp6RUZldXplcU0zSE9LenFRL1U4ZVhaM0VkRmNSMD0=
+            target: '{{ signal_target }}'
           enabled: true

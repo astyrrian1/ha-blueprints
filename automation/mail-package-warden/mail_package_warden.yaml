@@ -1,10 +1,12 @@
 blueprint:
-  name: 'System: Mail & Package Warden V2.3 (State Guard)'
-  description: 'Nuclear Mail/Package management. * **Fix:** Prevents double-counting
-    mail after reboots (State Guard). * **Configured Volume:** Enforced volume control.
+  name: 'System: Mail & Package Warden V3.0 (State Guard)'
+  description: >-
+    Nuclear Mail/Package management.
+    * **Fix:** Prevents double-counting mail after reboots (State Guard).
+    * **Fix:** Re-fetches todo items after door wait to prevent stale data.
+    * **Configured Volume:** Enforced volume control.
     * **Circuit Breaker:** AI Rate Limits handled safely.
-
-    '
+    * **Quiet Hours:** Respects do-not-disturb window for TTS broadcasts.
   domain: automation
   input:
     announce_volume:
@@ -108,6 +110,18 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
+    quiet_hours_start:
+      name: Quiet Hours Start
+      description: TTS broadcasts are suppressed after this time.
+      default: '23:00:00'
+      selector:
+        time: {}
+    quiet_hours_end:
+      name: Quiet Hours End
+      description: TTS broadcasts resume after this time.
+      default: '07:00:00'
+      selector:
+        time: {}
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/mail-package-warden/mail_package_warden.yaml
 mode: queued
 max: 10
@@ -144,59 +158,83 @@ action:
     s_ups_pkg: !input ups_package_sensor
     s_fedex_pkg: !input fedex_package_sensor
     s_amazon_pkg: !input amazon_package_sensor
+    quiet_start: !input quiet_hours_start
+    quiet_end: !input quiet_hours_end
     current_p_count: '{{ states(p_sensor) | int(0) }}'
-    is_manual: '{{ trigger is not defined or trigger.platform is not defined or trigger.platform
-      == none }}'
+    is_manual: >-
+      {{ trigger is not defined or trigger.platform is not defined
+         or trigger.platform == none }}
     trigger_id: '{{ trigger.entity_id if not is_manual else '''' }}'
-    at_home: "{{ states.person | selectattr('state', 'eq', 'home') \n   | map(attribute='attributes.friendly_name')
-      | list }}"
-    worker_name: '{{ at_home | join('' and '') if at_home | length > 0 else ''Justin
-      or Jaramie'' }}'
-    open_pkg_tasks: "{{ current_items[todo_target]['items'] \n   | selectattr('status',
-      'eq', 'needs_action') \n   | selectattr('summary', 'search', 'Retrieve .* Packages',
-      ignorecase=true) | list }}"
+    at_home: >-
+      {{ states.person | selectattr('state', 'eq', 'home')
+         | map(attribute='attributes.friendly_name') | list }}
+    worker_name: >-
+      {{ at_home | join(' and ') if at_home | length > 0 else 'the household' }}
+    open_pkg_tasks: >-
+      {{ current_items[todo_target]['items']
+         | selectattr('status', 'eq', 'needs_action')
+         | selectattr('summary', 'search', 'Retrieve .* Packages', ignorecase=true) | list }}
+    is_quiet_hours: >-
+      {% set now_t = now().strftime('%H:%M:%S') %}
+      {% if quiet_start > quiet_end %}
+        {{ now_t >= quiet_start or now_t < quiet_end }}
+      {% else %}
+        {{ now_t >= quiet_start and now_t < quiet_end }}
+      {% endif %}
 - choose:
   - conditions:
     - condition: trigger
       id: vision_drop
     - condition: template
-      value_template: '{{ current_p_count > open_pkg_tasks | length }}'
+      value_template: '{{ current_p_count >= open_pkg_tasks | length }}'
     sequence:
     - action: ai_task.generate_data
       continue_on_error: true
       data:
         entity_id: '{{ ai_ent }}'
         task_name: Vision Verification
-        instructions: 'Persona: Sassy. Doorbell AI sees {{ current_p_count }} boxes.
-          Announce delivery.'
+        instructions: >-
+          Persona: Sassy. Doorbell AI sees {{ current_p_count }} boxes.
+          Announce delivery.
         structure:
           spoken_text:
             selector:
               text: {}
       response_variable: ai_speech
     - variables:
-        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
-          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  Doorbell confirms {{ current_p_count
-          }} packages are at the door.\n{% endif %}"
-    - action: script.system_smart_voice_broadcast
-      data:
-        message: '{{ final_speech }}'
-        tts_entity: '{{ tts_ent }}'
-        announce_volume: '{{ vol }}'
+        final_speech: >-
+          {% if ai_speech is defined and ai_speech.data is defined %}
+            {{ ai_speech.data.spoken_text }}
+          {% else %}
+            Doorbell confirms {{ current_p_count }} packages are at the door.
+          {% endif %}
+    - if: '{{ not is_quiet_hours }}'
+      then:
+      - action: script.system_smart_voice_broadcast
+        data:
+          message: '{{ final_speech }}'
+          tts_entity: '{{ tts_ent }}'
+          announce_volume: '{{ vol }}'
   - conditions:
     - condition: template
-      value_template: "{{ (not is_manual) and \n   (trigger_id in [s_usps_pkg, s_ups_pkg,
-        s_fedex_pkg, s_amazon_pkg]) }}\n"
+      value_template: >-
+        {{ (not is_manual) and
+           (trigger_id in [s_usps_pkg, s_ups_pkg, s_fedex_pkg, s_amazon_pkg]) }}
     - condition: template
       value_template: '{{ trigger.to_state.state | int(0) > 0 }}'
     sequence:
     - variables:
-        carrier: '{% if trigger_id == s_usps_pkg %} USPS {% elif trigger_id == s_ups_pkg
-          %} UPS {% elif trigger_id == s_fedex_pkg %} FedEx {% elif trigger_id ==
-          s_amazon_pkg %} Amazon {% else %} Unknown {% endif %}'
+        carrier: >-
+          {% if trigger_id == s_usps_pkg %} USPS
+          {% elif trigger_id == s_ups_pkg %} UPS
+          {% elif trigger_id == s_fedex_pkg %} FedEx
+          {% elif trigger_id == s_amazon_pkg %} Amazon
+          {% else %} Unknown {% endif %}
         task_title: Retrieve {{ carrier }} Packages
-        existing_task: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-          ''eq'', task_title) | list | first | default(none) }}'
+        existing_task: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_title)
+             | list | first | default(none) }}
     - choose:
       - conditions: '{{ existing_task != none }}'
         sequence:
@@ -225,36 +263,43 @@ action:
               text: {}
       response_variable: ai_speech
     - variables:
-        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
-          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  {{ carrier }} has just
-          reported a new delivery.\n{% endif %}"
-    - action: script.system_smart_voice_broadcast
-      data:
-        message: '{{ final_speech }}'
-        tts_entity: '{{ tts_ent }}'
-        announce_volume: '{{ vol }}'
+        final_speech: >-
+          {% if ai_speech is defined and ai_speech.data is defined %}
+            {{ ai_speech.data.spoken_text }}
+          {% else %}
+            {{ carrier }} has just reported a new delivery.
+          {% endif %}
+    - if: '{{ not is_quiet_hours }}'
+      then:
+      - action: script.system_smart_voice_broadcast
+        data:
+          message: '{{ final_speech }}'
+          tts_entity: '{{ tts_ent }}'
+          announce_volume: '{{ vol }}'
   - conditions:
     - condition: template
       value_template: '{{ (not is_manual) and (trigger_id == s_usps_mail) }}'
     - condition: template
-      value_template: '{{ trigger.from_state.state not in [''unavailable'', ''unknown'']
-        }}'
+      value_template: >-
+        {{ trigger.from_state.state not in ['unavailable', 'unknown'] }}
     - condition: template
-      value_template: '{{ trigger.to_state.state | int(0) > trigger.from_state.state
-        | int(0) }}'
+      value_template: >-
+        {{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}
     sequence:
     - variables:
-        new_pieces: '{{ trigger.to_state.state | int(0) - trigger.from_state.state
-          | int(0) }}'
-        active_mail_task: "{{ current_items[todo_target]['items'] \n   | selectattr('status',
-          'eq', 'needs_action')\n   | selectattr('summary', 'search', '^Check Mail')
-          \n   | list | first | default(none) }}"
+        new_pieces: >-
+          {{ trigger.to_state.state | int(0) - trigger.from_state.state | int(0) }}
+        active_mail_task: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('status', 'eq', 'needs_action')
+             | selectattr('summary', 'search', '^Check Mail')
+             | list | first | default(none) }}
     - choose:
       - conditions: '{{ active_mail_task != none }}'
         sequence:
         - variables:
-            old_count: '{{ active_mail_task.summary | regex_findall(''\d+'') | first
-              | default(0) | int }}'
+            old_count: >-
+              {{ active_mail_task.summary | regex_findall('\d+') | first | default(0) | int }}
             total_count: '{{ old_count + new_pieces }}'
         - action: todo.update_item
           target:
@@ -281,14 +326,19 @@ action:
               text: {}
       response_variable: ai_speech
     - variables:
-        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
-          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  The mail has arrived.
-          {{ new_pieces }} pieces counted.\n{% endif %}"
-    - action: script.system_smart_voice_broadcast
-      data:
-        message: '{{ final_speech }}'
-        tts_entity: '{{ tts_ent }}'
-        announce_volume: '{{ vol }}'
+        final_speech: >-
+          {% if ai_speech is defined and ai_speech.data is defined %}
+            {{ ai_speech.data.spoken_text }}
+          {% else %}
+            The mail has arrived. {{ new_pieces }} pieces counted.
+          {% endif %}
+    - if: '{{ not is_quiet_hours }}'
+      then:
+      - action: script.system_smart_voice_broadcast
+        data:
+          message: '{{ final_speech }}'
+          tts_entity: '{{ tts_ent }}'
+          announce_volume: '{{ vol }}'
   - conditions:
     - condition: trigger
       id: door_interaction
@@ -300,10 +350,20 @@ action:
         for: 00:01:00
       timeout: 00:05:00
       continue_on_timeout: false
-    - if: '{{ open_pkg_tasks | length > 0 }}'
+    # Re-fetch todo items after wait to prevent stale data
+    - action: todo.get_items
+      target:
+        entity_id: !input todo_list
+      response_variable: fresh_items
+    - variables:
+        fresh_pkg_tasks: >-
+          {{ fresh_items[todo_target]['items']
+             | selectattr('status', 'eq', 'needs_action')
+             | selectattr('summary', 'search', 'Retrieve .* Packages', ignorecase=true) | list }}
+    - if: '{{ fresh_pkg_tasks | length > 0 }}'
       then:
       - repeat:
-          for_each: '{{ open_pkg_tasks }}'
+          for_each: '{{ fresh_pkg_tasks }}'
           sequence:
           - action: todo.update_item
             target:
@@ -316,22 +376,27 @@ action:
         data:
           entity_id: '{{ ai_ent }}'
           task_name: Retrieved Slay
-          instructions: 'Persona: Sassy. {{ worker_name }} cleared the porch. Thank
-            them.'
+          instructions: >-
+            Persona: Sassy. {{ worker_name }} cleared the porch. Thank them.
           structure:
             spoken_text:
               selector:
                 text: {}
         response_variable: ai_speech
       - variables:
-          final_speech: "{% if ai_speech is defined and ai_speech.data is defined
-            %}\n  {{ ai_speech.data.spoken_text }}\n{% else %}\n  Packages retrieved
-            by {{ worker_name }}. Thank you!\n{% endif %}"
-      - action: script.system_smart_voice_broadcast
-        data:
-          message: '{{ final_speech }}'
-          tts_entity: '{{ tts_ent }}'
-          announce_volume: '{{ vol }}'
+          final_speech: >-
+            {% if ai_speech is defined and ai_speech.data is defined %}
+              {{ ai_speech.data.spoken_text }}
+            {% else %}
+              Packages retrieved by {{ worker_name }}. Thank you!
+            {% endif %}
+      - if: '{{ not is_quiet_hours }}'
+        then:
+        - action: script.system_smart_voice_broadcast
+          data:
+            message: '{{ final_speech }}'
+            tts_entity: '{{ tts_ent }}'
+            announce_volume: '{{ vol }}'
       - event: gratitude_award
         event_data:
           person: '{{ worker_name }}'

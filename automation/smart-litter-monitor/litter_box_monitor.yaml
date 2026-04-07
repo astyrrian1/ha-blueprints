@@ -1,11 +1,13 @@
 blueprint:
-  name: 'System: Smart Litter Monitor V15.1 (Hybrid)'
-  description: 'Complete Litter Management. * **Cleanliness:** Monitors ''Empty''
-    vs ''Full'' status (V14 Core). * **Refill:** Monitors ''Insufficient'' litter
-    levels (New). * **Fix:** Corrected YAML indentation in logic blocks. * **Anti-Dupe:**
-    Manages two distinct tasks without collision.
-
-    '
+  name: 'System: Smart Litter Monitor V16 (Hybrid)'
+  description: >-
+    Complete Litter Management.
+    * **Cleanliness:** Monitors 'Empty' vs 'Full' status.
+    * **Refill:** Monitors 'Insufficient' litter levels.
+    * **Voice:** AI-powered sassy TTS announcements with circuit-breaker fallback.
+    * **Default Branch:** Logs unrecognized sensor states instead of silently dropping.
+    * **Queued Mode:** Handles simultaneous sensor changes without dropping events.
+    * **Anti-Dupe:** Manages two distinct tasks without collision.
   domain: automation
   input:
     litter_box_name:
@@ -13,7 +15,7 @@ blueprint:
       default: Litter Box
     status_sensor:
       name: Cleanliness Sensor
-      description: Detects if box is Full
+      description: Detects if box is Full.
       selector:
         entity:
           domain:
@@ -22,8 +24,8 @@ blueprint:
           reorder: false
     litter_level_sensor:
       name: Litter Level Sensor
-      description: Detects if litter is Insufficient
-      default: sensor.jq01009g24300010823_cat_litter_state
+      description: Detects if litter is Insufficient.
+
       selector:
         entity:
           domain:
@@ -44,7 +46,38 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
+    ai_task_entity:
+      name: AI Task Entity (Optional)
+      description: AI entity for generating sassy voice announcements.
+      default: ai_task.google_ai_task
+      selector:
+        entity:
+          domain:
+          - ai_task
+          multiple: false
+          reorder: false
+    tts_engine:
+      name: TTS Entity (Optional)
+      description: Text-to-speech provider for voice broadcasts.
+      default: tts.google_ai_tts_3
+      selector:
+        entity:
+          domain:
+          - tts
+          multiple: false
+          reorder: false
+    announce_volume:
+      name: Announcement Volume
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.05
+          mode: slider
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-litter-monitor/litter_box_monitor.yaml
+mode: queued
+max: 5
 trigger:
 - platform: state
   entity_id:
@@ -61,134 +94,152 @@ action:
     name: !input litter_box_name
     status_ent: !input status_sensor
     level_ent: !input litter_level_sensor
-    clean_task_title: Empty {{ name }}
-    clean_notify_id: litter_{{ name | slugify }}_full
-    refill_task_title: 'Refill Litter: {{ name }}'
-    refill_notify_id: litter_{{ name | slugify }}_refill
-    worker_name: "{% set home = states.person | selectattr('state','eq','home') |
-      map(attribute='attributes.friendly_name') | list %} {% if home | length > 0
-      %}\n  {{ home | join(' and ') }}\n{% else %}\n  {% set recent = states.person
-      | selectattr('state','ne','home') | sort(attribute='last_changed', reverse=true)
-      | first %}\n  {% if recent is defined and recent is not none and (now() - recent.last_changed).total_seconds()
-      < 600 %}\n    {{ recent.attributes.friendly_name }}\n  {% else %}\n    none\n
-      \ {% endif %}\n{% endif %}"
-- variables:
-    active_clean_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-      ''eq'', clean_task_title) | selectattr(''status'', ''eq'', ''needs_action'')
-      | map(attribute=''uid'') | list }}'
-    closed_clean_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-      ''eq'', clean_task_title) | selectattr(''status'', ''eq'', ''completed'') |
-      map(attribute=''uid'') | list }}'
-- choose:
-  - conditions: '{{ is_state(status_ent, ''full'') }}'
+    ai_ent: !input ai_task_entity
+    tts_ent: !input tts_engine
+    vol: !input announce_volume
+    home_persons: >-
+      {{ states.person | selectattr('state','eq','home')
+         | map(attribute='attributes.friendly_name') | list }}
+    recent_person: >-
+      {% set recent = states.person
+         | selectattr('state','ne','home')
+         | sort(attribute='last_changed', reverse=true)
+         | first | default(none) %}
+      {% if recent is not none and (now() - recent.last_changed).total_seconds() < 600 %}
+        {{ recent.attributes.friendly_name }}
+      {% endif %}
+    worker_name: >-
+      {% if home_persons | length > 0 %}
+        {{ home_persons | join(' and ') }}
+      {% elif recent_person | length > 0 %}
+        {{ recent_person }}
+      {% endif %}
+    has_worker: >-
+      {{ home_persons | length > 0 or recent_person | length > 0 }}
+    # Consolidated checks list for both cleanliness and refill
+    checks:
+    - type: clean
+      is_issue: '{{ is_state(status_ent, ''full'') }}'
+      is_ok: >-
+        {{ is_state(status_ent, 'empty') or is_state(status_ent, 'ok') }}
+      task: Empty {{ name }}
+      id: litter_{{ name | slugify }}_full
+      title_done: ✨ Litter Cleaned!
+      chore: Litter Box (Cleaning)
+    - type: refill
+      is_issue: '{{ is_state(level_ent, ''insufficient'') }}'
+      is_ok: >-
+        {{ not is_state(level_ent, 'insufficient')
+           and not is_state(level_ent, 'unavailable')
+           and not is_state(level_ent, 'unknown') }}
+      task: 'Refill Litter: {{ name }}'
+      id: litter_{{ name | slugify }}_refill
+      title_done: "\U0001F3D6️ Litter Refilled!"
+      chore: Litter Box (Refill)
+- repeat:
+    for_each: '{{ checks }}'
     sequence:
+    - variables:
+        active_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', repeat.item.task)
+             | selectattr('status', 'eq', 'needs_action')
+             | map(attribute='uid') | list }}
+        closed_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', repeat.item.task)
+             | selectattr('status', 'eq', 'completed')
+             | map(attribute='uid') | list }}
     - choose:
-      - conditions: '{{ active_clean_uids | length > 0 }}'
-        sequence: []
-      - conditions: '{{ closed_clean_uids | length > 0 }}'
+      # --- Issue detected: create or reopen task ---
+      - conditions: '{{ repeat.item.is_issue | bool }}'
         sequence:
-        - action: todo.update_item
-          target:
-            entity_id: !input todo_list
-          data:
-            item: '{{ closed_clean_uids[0] }}'
-            status: needs_action
-      default:
-      - action: todo.add_item
-        target:
-          entity_id: !input todo_list
-        data:
-          item: '{{ clean_task_title }}'
-  - conditions: '{{ is_state(status_ent, ''empty'') or is_state(status_ent, ''ok'')
-      }}'
-    sequence:
-    - if: '{{ active_clean_uids | length > 0 }}'
-      then:
-      - action: todo.update_item
-        target:
-          entity_id: !input todo_list
-        data:
-          item: '{{ active_clean_uids[0] }}'
-          status: completed
-      - if: '{{ worker_name != ''none'' }}'
-        then:
-        - repeat:
-            for_each: '{{ notify_devs }}'
+        - choose:
+          - conditions: '{{ active_uids | length > 0 }}'
+            sequence: []
+          - conditions: '{{ closed_uids | length > 0 }}'
             sequence:
-            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
-                }}
+            - action: todo.update_item
+              target:
+                entity_id: !input todo_list
               data:
-                title: ✨ Litter Cleaned!
-                message: "{% set dev = device_attr(repeat.item, 'name') | lower %}
-                  {% if worker_name | lower in dev %}\n  You slayed that task! ✅\n{%
-                  else %}\n  {{ worker_name }} just cleaned the {{ name }}! ❤️\n{%
-                  endif %}"
-                data:
-                  tag: gratitude_{{ clean_notify_id }}
-        - event: gratitude_award
-          event_data:
-            person: '{{ worker_name }}'
-            chore: Litter Box (Cleaning)
-    - action: persistent_notification.dismiss
-      data:
-        notification_id: '{{ clean_notify_id }}'
-- variables:
-    active_refill_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-      ''eq'', refill_task_title) | selectattr(''status'', ''eq'', ''needs_action'')
-      | map(attribute=''uid'') | list }}'
-    closed_refill_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-      ''eq'', refill_task_title) | selectattr(''status'', ''eq'', ''completed'') |
-      map(attribute=''uid'') | list }}'
-- choose:
-  - conditions: '{{ is_state(level_ent, ''insufficient'') }}'
-    sequence:
-    - choose:
-      - conditions: '{{ active_refill_uids | length > 0 }}'
-        sequence: []
-      - conditions: '{{ closed_refill_uids | length > 0 }}'
+                item: '{{ closed_uids[0] }}'
+                status: needs_action
+          default:
+          - action: todo.add_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ repeat.item.task }}'
+        # --- Voice announcement for new issues ---
+        - if: '{{ active_uids | length == 0 }}'
+          then:
+          - action: ai_task.generate_data
+            continue_on_error: true
+            data:
+              entity_id: '{{ ai_ent }}'
+              task_name: Litter Alert
+              instructions: >-
+                Persona: Sassy Assistant. The {{ name }} needs attention.
+                Issue: {{ repeat.item.type }}. Announce it needs to be dealt with.
+                Format: Short sentence for TTS.
+              structure:
+                spoken_text:
+                  selector:
+                    text: {}
+            response_variable: ai_speech
+          - variables:
+              final_speech: >-
+                {% if ai_speech is defined and ai_speech.data is defined %}
+                  {{ ai_speech.data.spoken_text }}
+                {% else %}
+                  The {{ name | lower }} needs {{ repeat.item.type }}. Please take care of it.
+                {% endif %}
+          - action: script.system_smart_voice_broadcast
+            data:
+              message: '{{ final_speech }}'
+              tts_entity: '{{ tts_ent }}'
+              announce_volume: '{{ vol }}'
+      # --- Issue resolved: complete task + gratitude ---
+      - conditions: '{{ repeat.item.is_ok | bool }}'
         sequence:
-        - action: todo.update_item
-          target:
-            entity_id: !input todo_list
+        - if: '{{ active_uids | length > 0 }}'
+          then:
+          - action: todo.update_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ active_uids[0] }}'
+              status: completed
+          - if: '{{ has_worker }}'
+            then:
+            - repeat:
+                for_each: '{{ notify_devs }}'
+                sequence:
+                - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+                  data:
+                    title: '{{ repeat.item.title_done }}'
+                    message: >-
+                      {% set dev = device_attr(repeat.item, 'name') | lower %}
+                      {% if worker_name | lower in dev %}
+                        You slayed that task! ✅
+                      {% else %}
+                        {{ worker_name }} just handled the {{ name }}! ❤️
+                      {% endif %}
+                    data:
+                      tag: gratitude_{{ repeat.item.id }}
+            - event: gratitude_award
+              event_data:
+                person: '{{ worker_name }}'
+                chore: '{{ repeat.item.chore }}'
+        - action: persistent_notification.dismiss
           data:
-            item: '{{ closed_refill_uids[0] }}'
-            status: needs_action
+            notification_id: '{{ repeat.item.id }}'
+      # --- Default: unrecognized state — log it ---
       default:
-      - action: todo.add_item
-        target:
-          entity_id: !input todo_list
+      - action: system_log.write
         data:
-          item: '{{ refill_task_title }}'
-  - conditions: '{{ not is_state(level_ent, ''insufficient'') and not is_state(level_ent,
-      ''unavailable'') and not is_state(level_ent, ''unknown'') }}'
-    sequence:
-    - if: '{{ active_refill_uids | length > 0 }}'
-      then:
-      - action: todo.update_item
-        target:
-          entity_id: !input todo_list
-        data:
-          item: '{{ active_refill_uids[0] }}'
-          status: completed
-      - if: '{{ worker_name != ''none'' }}'
-        then:
-        - repeat:
-            for_each: '{{ notify_devs }}'
-            sequence:
-            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
-                }}
-              data:
-                title: "\U0001F3D6️ Litter Refilled!"
-                message: "{% set dev = device_attr(repeat.item, 'name') | lower %}
-                  {% if worker_name | lower in dev %}\n  Top-up complete! ✅\n{% else
-                  %}\n  {{ worker_name }} just refilled the {{ name }}! ❤️\n{% endif
-                  %}"
-                data:
-                  tag: gratitude_{{ refill_notify_id }}
-        - event: gratitude_award
-          event_data:
-            person: '{{ worker_name }}'
-            chore: Litter Box (Refill)
-    - action: persistent_notification.dismiss
-      data:
-        notification_id: '{{ refill_notify_id }}'
+          message: >-
+            Litter Monitor: Unrecognized state for {{ repeat.item.type }}.
+            Status={{ states(status_ent) }}, Level={{ states(level_ent) }}.
+          level: warning

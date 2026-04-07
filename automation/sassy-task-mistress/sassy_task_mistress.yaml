@@ -1,12 +1,13 @@
 blueprint:
-  name: 'System: Sassy Task Mistress V3.0 (The Resurrection)'
-  description: 'The Advanced Sassy Reminders Engine. * **Restored V2.9:** ''Unplugged''
-    trigger with Morning Motion Wait logic. * **Circuit Breaker:** AI outages degrade
-    to static sass instead of crashing. * **Urgency Math:** Complex frequency gating
-    based on exact hour blocks. * **Jaramie Guard:** Silences if Jaramie is solo +
-    charging.
-
-    '
+  name: 'System: Sassy Task Mistress V4.0 (The Resurrection)'
+  description: >-
+    The Advanced Sassy Reminders Engine.
+    * **Restored V2.9:** 'Unplugged' trigger with Morning Motion Wait logic.
+    * **Circuit Breaker:** AI outages degrade to static sass (capped at 5 tasks).
+    * **Urgency Math:** Commented frequency gating based on time blocks.
+    * **Sleep Guard:** Silences if the designated person is solo + charging.
+    * **Do Not Disturb:** Configurable end-of-day cutoff.
+    * **Unique Tags:** Each reminder gets a timestamped notification tag.
   domain: automation
   input:
     todo_list:
@@ -17,18 +18,20 @@ blueprint:
           - todo
           multiple: false
           reorder: false
-    jaramie_person:
-      name: Jaramie Person Entity
-      default: person.jaramie_mondragon
+    sleep_person:
+      name: Sleep Person Entity
+      description: Person whose charging/sleeping state should suppress reminders when they are the only one home.
+
       selector:
         entity:
           domain:
           - person
           multiple: false
           reorder: false
-    jaramie_phone_sensor:
-      name: Jaramie Phone Battery State
-      default: sensor.pixel_10_battery_state
+    sleep_phone_sensor:
+      name: Sleep Person Phone Battery State
+      description: Phone battery state sensor for the sleep person. When 'charging' or 'full', reminders are suppressed.
+
       selector:
         entity:
           domain:
@@ -37,8 +40,8 @@ blueprint:
           reorder: false
     activity_sensor:
       name: Morning Activity Sensor
-      description: Motion sensor to verify waking up (4am-6am)
-      default: binary_sensor.bcls_activity_group
+      description: Motion sensor to verify waking up (4am–6am).
+
       selector:
         entity:
           domain:
@@ -78,6 +81,12 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
+    do_not_disturb_after:
+      name: Do Not Disturb After
+      description: Stop sending reminders after this time. Prevents late-night nagging.
+      default: '23:00:00'
+      selector:
+        time: {}
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/sassy-task-mistress/sassy_task_mistress.yaml
 mode: single
 max_exceeded: silent
@@ -85,7 +94,7 @@ trigger:
 - platform: time_pattern
   minutes: /15
 - platform: state
-  entity_id: !input jaramie_phone_sensor
+  entity_id: !input sleep_phone_sensor
   from: charging
   to: discharging
   id: unplugged
@@ -96,46 +105,90 @@ action:
   response_variable: current_items
 - variables:
     todo_target: !input todo_list
-    p_jaramie: !input jaramie_person
-    s_phone: !input jaramie_phone_sensor
+    p_sleep: !input sleep_person
+    s_phone: !input sleep_phone_sensor
     s_activity: !input activity_sensor
     vol: !input announce_volume
     tts_ent: !input tts_engine
     ai_ent: !input ai_task_entity
     notify_devs: !input notify_target
+    dnd_after: !input do_not_disturb_after
     h: '{{ now().hour }}'
     m: '{{ now().minute }}'
-    is_manual: '{{ trigger is not defined or trigger.platform is not defined or trigger.platform
-      == none }}'
+    is_manual: >-
+      {{ trigger is not defined or trigger.platform is not defined
+         or trigger.platform == none }}
     trigger_id: '{{ trigger.id if not is_manual else ''manual'' }}'
-    open_tasks_list: "{{ current_items[todo_target]['items'] \n   | selectattr('status',
-      'eq', 'needs_action') \n   | map(attribute='summary') | list }}"
+    open_tasks_list: >-
+      {{ current_items[todo_target]['items']
+         | selectattr('status', 'eq', 'needs_action')
+         | map(attribute='summary') | list }}
     task_count: '{{ open_tasks_list | length }}'
+    # Cap task text at 5 items to avoid wall-of-text in fallback messages
+    task_preview: >-
+      {% set preview = open_tasks_list[:5] | join(', ') %}
+      {% if task_count | int > 5 %}
+        {{ preview }}, and {{ task_count | int - 5 }} more
+      {% else %}
+        {{ preview }}
+      {% endif %}
     task_text: '{{ open_tasks_list | join('', '') }}'
     home_count: '{{ states(''zone.home'') | int(0) }}'
-    is_solo_jaramie: '{{ home_count == 1 and is_state(p_jaramie, ''home'') }}'
-    jaramie_charging: '{{ is_state(s_phone, ''charging'') or is_state(s_phone, ''full'')
-      }}'
+    is_solo_sleep: '{{ home_count == 1 and is_state(p_sleep, ''home'') }}'
+    sleep_charging: >-
+      {{ is_state(s_phone, 'charging') or is_state(s_phone, 'full') }}
+# --- Gate: No open tasks ---
 - if: '{{ task_count == 0 }}'
   then:
   - stop: No tasks. Slay.
 - variables:
-    urgency_level: '{% if 4 <= h < 12 %} Low {% elif 12 <= h < 17 %} Medium {% elif
-      17 <= h < 20 %} High {% elif 20 <= h < 22 %} Very High {% else %} Nuclear {%
-      endif %}'
-    should_run: '{% if is_manual or trigger_id == ''unplugged'' %} true {% elif 4
-      <= h < 12 %} {{ (h % 3 == 0 or h == 4) and m == 0 }} {% elif 12 <= h < 17 %}
-      {{ h % 2 == 0 and m == 0 }} {% elif 17 <= h < 20 %} {{ m == 0 }} {% elif 20
-      <= h < 22 %} {{ m % 30 == 0 }} {% else %} true {% endif %}'
+    # Urgency escalates throughout the day
+    urgency_level: >-
+      {% if 4 <= h < 12 %} Low
+      {% elif 12 <= h < 17 %} Medium
+      {% elif 17 <= h < 20 %} High
+      {% elif 20 <= h < 22 %} Very High
+      {% else %} Nuclear
+      {% endif %}
+    # Frequency gating: controls how often reminders fire per time block
+    # - 04:00–11:59 (Low): Every 3 hours on the hour (04:00, 06:00, 09:00)
+    # - 12:00–16:59 (Medium): Every 2 hours on the hour
+    # - 17:00–19:59 (High): Every hour on the hour
+    # - 20:00–21:59 (Very High): Every 30 minutes
+    # - 22:00+ (Nuclear): Every 15-minute slot (if before DND cutoff)
+    # Manual runs and unplugged triggers always pass
+    should_run: >-
+      {% if is_manual or trigger_id == 'unplugged' %}
+        true
+      {% elif 4 <= h < 12 %}
+        {{ (h % 3 == 0 or h == 4) and m == 0 }}
+      {% elif 12 <= h < 17 %}
+        {{ h % 2 == 0 and m == 0 }}
+      {% elif 17 <= h < 20 %}
+        {{ m == 0 }}
+      {% elif 20 <= h < 22 %}
+        {{ m % 30 == 0 }}
+      {% else %}
+        true
+      {% endif %}
+    # Do-not-disturb check: suppress after configured cutoff
+    is_past_dnd: >-
+      {{ now().strftime('%H:%M:%S') >= dnd_after }}
+# --- Gate: Frequency ---
 - if: '{{ not should_run }}'
   then:
   - stop: 'Frequency Gate: Skipping this slot.'
+# --- Gate: Do Not Disturb ---
+- if: '{{ is_past_dnd and not is_manual }}'
+  then:
+  - stop: 'DND Gate: Past do-not-disturb cutoff.'
+# --- Gate: Sleep person is solo + charging ---
 - if:
   - condition: template
-    value_template: '{{ trigger_id != ''unplugged'' and is_solo_jaramie and jaramie_charging
-      }}'
+    value_template: '{{ trigger_id != ''unplugged'' and is_solo_sleep and sleep_charging }}'
   then:
-  - stop: Jaramie is sleeping/charging. Shhh.
+  - stop: Sleep person is charging. Shhh.
+# --- Morning wait: unplugged between 4–6 AM waits for activity ---
 - if:
   - condition: template
     value_template: '{{ trigger_id == ''unplugged'' and 4 <= h < 6 }}'
@@ -147,17 +200,17 @@ action:
     timeout: 00:30:00
     continue_on_timeout: false
   - delay: 00:00:15
+# --- Generate AI announcement ---
 - action: ai_task.generate_data
   continue_on_error: true
   data:
     entity_id: '{{ ai_ent }}'
     task_name: Sassy Task Reminder
-    instructions: 'Persona: Drag Queen / Sassy Assistant. Urgency: {{ urgency_level
-      }}. Tasks: {{ task_text }}. Context: It is {{ now().strftime(''%I:%M %p'') }}.
+    instructions: >-
+      Persona: Drag Queen / Sassy Assistant. Urgency: {{ urgency_level }}.
+      Tasks: {{ task_text }}. Context: It is {{ now().strftime('%I:%M %p') }}.
       Trigger: {{ trigger_id }}. Goal: Read the filth. If urgency is Low, be gentle.
       If Nuclear, READ THEM. Format: Keep it under 2 sentences for speech.
-
-      '
     structure:
       spoken_text:
         selector:
@@ -170,14 +223,24 @@ action:
           text: {}
   response_variable: ai_sass
 - variables:
-    final_speech: "{% if ai_sass is defined and ai_sass.data is defined %}\n  {{ ai_sass.data.spoken_text
-      }}\n{% else %}\n  Honey, the AI is tired but you can't be. Do these: {{ task_text
-      }}.\n{% endif %}"
-    final_title: "{% if ai_sass is defined and ai_sass.data is defined %}\n  {{ ai_sass.data.notification_title
-      }}\n{% else %}\n  \U0001F485 Task Reminder (Fallback)\n{% endif %}"
-    final_body: "{% if ai_sass is defined and ai_sass.data is defined %}\n  {{ ai_sass.data.notification_body
-      }}\n{% else %}\n  You have {{ task_count }} pending tasks. Chop chop!\n{% endif
-      %}"
+    final_speech: >-
+      {% if ai_sass is defined and ai_sass.data is defined %}
+        {{ ai_sass.data.spoken_text }}
+      {% else %}
+        Honey, the AI is tired but you can't be. Do these: {{ task_preview }}.
+      {% endif %}
+    final_title: >-
+      {% if ai_sass is defined and ai_sass.data is defined %}
+        {{ ai_sass.data.notification_title }}
+      {% else %}
+        💅 Task Reminder (Fallback)
+      {% endif %}
+    final_body: >-
+      {% if ai_sass is defined and ai_sass.data is defined %}
+        {{ ai_sass.data.notification_body }}
+      {% else %}
+        You have {{ task_count }} pending tasks. Chop chop!
+      {% endif %}
 - parallel:
   - action: script.system_smart_voice_broadcast
     data:
@@ -192,7 +255,7 @@ action:
           title: '{{ final_title }}'
           message: '{{ final_body }}'
           data:
-            tag: sassy_reminders
+            tag: sassy_{{ now().strftime('%Y%m%d_%H%M') }}
             importance: high
             actions:
             - action: URI

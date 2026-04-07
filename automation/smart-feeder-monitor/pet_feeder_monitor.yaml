@@ -1,10 +1,12 @@
 blueprint:
-  name: 'System: Smart Feeder Monitor V11 (Stable)'
-  description: 'Nuclear Feeder Management. * **Fix:** Implemented ''Entity ID Lookup''
-    for attribution to prevent string errors. * **Syntax:** Mapped inputs to variables
-    to prevent Jinja errors. * **Anti-Dupe:** Standardized logic to prevent task collisions.
-
-    '
+  name: 'System: Smart Feeder Monitor V12 (Hybrid)'
+  description: >-
+    Nuclear Feeder Management.
+    * **Fix:** Boolean comparisons use `| bool` filter for safety.
+    * **Queued Mode:** Handles simultaneous sensor changes without dropping events.
+    * **Voice:** AI-powered sassy TTS announcements with circuit-breaker fallback.
+    * **Debounce:** Triggers use `for:` to ignore momentary sensor flickers.
+    * **Smart Desiccant:** Only fires on threshold crossing, not every update.
   domain: automation
   input:
     feeder_name:
@@ -64,13 +66,53 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
+    ai_task_entity:
+      name: AI Task Entity (Optional)
+      description: AI entity for generating sassy voice announcements.
+      default: ai_task.google_ai_task
+      selector:
+        entity:
+          domain:
+          - ai_task
+          multiple: false
+          reorder: false
+    tts_engine:
+      name: TTS Entity (Optional)
+      description: Text-to-speech provider for voice broadcasts.
+      default: tts.google_ai_tts_3
+      selector:
+        entity:
+          domain:
+          - tts
+          multiple: false
+          reorder: false
+    announce_volume:
+      name: Announcement Volume
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.05
+          mode: slider
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-feeder-monitor/pet_feeder_monitor.yaml
+mode: queued
+max: 5
 trigger:
 - platform: state
   entity_id:
   - !input food_status_sensor
   - !input dispenser_sensor
-  - !input desiccant_sensor
+  for: 00:02:00
+  id: binary_change
+- platform: numeric_state
+  entity_id: !input desiccant_sensor
+  below: !input desiccant_threshold
+  id: desiccant_low
+- platform: numeric_state
+  entity_id: !input desiccant_sensor
+  above: !input desiccant_threshold
+  id: desiccant_ok
 action:
 - action: todo.get_items
   target:
@@ -84,15 +126,28 @@ action:
     d_sensor: !input desiccant_sensor
     j_sensor: !input dispenser_sensor
     d_limit: !input desiccant_threshold
-    at_home: "{{ states.person | selectattr('state', 'eq', 'home') \n   | map(attribute='attributes.friendly_name')
-      | list }}"
-    recent_exit_ids: "{{ states.person \n   | selectattr('state', 'ne', 'home') \n
-      \  | sort(attribute='last_changed', reverse=true) \n   | map(attribute='entity_id')
-      \n   | list }}"
-    worker_name: "{% if at_home | length > 0 %}\n  {{ at_home | join(' and ') }}\n{%
-      elif recent_exit_ids | length > 0 and (now() - states[recent_exit_ids[0]].last_changed).total_seconds()
-      < 600 %}\n  {{ state_attr(recent_exit_ids[0], 'friendly_name') }}\n{% else %}
-      none {% endif %}"
+    ai_ent: !input ai_task_entity
+    tts_ent: !input tts_engine
+    vol: !input announce_volume
+    home_persons: >-
+      {{ states.person | selectattr('state','eq','home')
+         | map(attribute='attributes.friendly_name') | list }}
+    recent_person: >-
+      {% set recent = states.person
+         | selectattr('state','ne','home')
+         | sort(attribute='last_changed', reverse=true)
+         | first | default(none) %}
+      {% if recent is not none and (now() - recent.last_changed).total_seconds() < 600 %}
+        {{ recent.attributes.friendly_name }}
+      {% endif %}
+    worker_name: >-
+      {% if home_persons | length > 0 %}
+        {{ home_persons | join(' and ') }}
+      {% elif recent_person | length > 0 %}
+        {{ recent_person }}
+      {% endif %}
+    has_worker: >-
+      {{ home_persons | length > 0 or recent_person | length > 0 }}
     checks:
     - type: food
       is_issue: '{{ is_state(f_sensor, ''on'') }}'
@@ -110,14 +165,19 @@ action:
     for_each: '{{ checks }}'
     sequence:
     - variables:
-        active_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
-          'eq', repeat.item.task) \n   | selectattr('status', 'eq', 'needs_action')
-          \n   | map(attribute='uid') | list }}"
-        closed_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
-          'eq', repeat.item.task) \n   | selectattr('status', 'eq', 'completed') \n
-          \  | map(attribute='uid') | list }}"
+        active_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', repeat.item.task)
+             | selectattr('status', 'eq', 'needs_action')
+             | map(attribute='uid') | list }}
+        closed_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', repeat.item.task)
+             | selectattr('status', 'eq', 'completed')
+             | map(attribute='uid') | list }}
     - choose:
-      - conditions: '{{ repeat.item.is_issue == ''True'' }}'
+      # --- Issue detected: create or reopen task ---
+      - conditions: '{{ repeat.item.is_issue | bool }}'
         sequence:
         - choose:
           - conditions: '{{ active_uids | length > 0 }}'
@@ -136,7 +196,36 @@ action:
               entity_id: !input todo_list
             data:
               item: '{{ repeat.item.task }}'
-      - conditions: '{{ repeat.item.is_issue == ''False'' }}'
+        # --- Voice announcement for new issues ---
+        - if: '{{ active_uids | length == 0 }}'
+          then:
+          - action: ai_task.generate_data
+            continue_on_error: true
+            data:
+              entity_id: '{{ ai_ent }}'
+              task_name: Feeder Alert
+              instructions: >-
+                Persona: Sassy Assistant. The {{ name }} has a {{ repeat.item.type }} issue.
+                Announce it needs attention. Format: Short sentence for TTS.
+              structure:
+                spoken_text:
+                  selector:
+                    text: {}
+            response_variable: ai_speech
+          - variables:
+              final_speech: >-
+                {% if ai_speech is defined and ai_speech.data is defined %}
+                  {{ ai_speech.data.spoken_text }}
+                {% else %}
+                  The {{ name | lower }} needs attention. {{ repeat.item.type | title }} issue detected.
+                {% endif %}
+          - action: script.system_smart_voice_broadcast
+            data:
+              message: '{{ final_speech }}'
+              tts_entity: '{{ tts_ent }}'
+              announce_volume: '{{ vol }}'
+      # --- Issue resolved: complete task + gratitude ---
+      - conditions: '{{ not (repeat.item.is_issue | bool) }}'
         sequence:
         - if: '{{ active_uids | length > 0 }}'
           then:
@@ -146,19 +235,21 @@ action:
             data:
               item: '{{ active_uids[0] }}'
               status: completed
-          - if: '{{ worker_name != ''none'' }}'
+          - if: '{{ has_worker }}'
             then:
             - repeat:
                 for_each: '{{ notify_devs }}'
                 sequence:
-                - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') |
-                    slugify }}
+                - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
                   data:
                     title: "\U0001F43E Feeder Serviced"
-                    message: "{% set dev = device_attr(repeat.item, 'name') | lower
-                      %} {% if worker_name | lower in dev %}\n  You slayed that maintenance!
-                      ✅\n{% else %}\n  {{ worker_name }} just fixed the {{ repeat.item.type
-                      }} issue! ❤️\n{% endif %}"
+                    message: >-
+                      {% set dev = device_attr(repeat.item, 'name') | lower %}
+                      {% if worker_name | lower in dev %}
+                        You slayed that maintenance! ✅
+                      {% else %}
+                        {{ worker_name }} just fixed the {{ repeat.item.type }} issue! ❤️
+                      {% endif %}
                     data:
                       tag: gratitude_{{ repeat.item.id }}
             - event: gratitude_award

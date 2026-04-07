@@ -1,11 +1,12 @@
 blueprint:
-  name: 'System: Global Battery Warden V12.4 (Atomic)'
-  description: 'Scans ALL battery sensors. * **Atomic Logic:** Calculates attribution
-    in one step to prevent object errors. * **Anti-Dupe:** Checks for Active tasks
-    before creating new ones. * **Gratitude:** Attributes maintenance to specific
-    residents.
-
-    '
+  name: 'System: Global Battery Warden V13.0 (Atomic)'
+  description: >-
+    Scans ALL battery sensors.
+    * **Atomic Logic:** Calculates attribution in one step to prevent object errors.
+    * **Anti-Dupe:** Checks for Active tasks before creating new ones.
+    * **Gratitude:** Attributes maintenance to specific residents.
+    * **Efficient:** Hourly full scan + instant numeric_state trigger on threshold crossing.
+    * **Smart Recovery:** Iterates open tasks (not all batteries) for efficient auto-close.
   domain: automation
   input:
     threshold:
@@ -42,21 +43,13 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
-    tts_engine:
-      name: TTS Entity
-      default: tts.google_ai_tts_3
-      selector:
-        entity:
-          domain:
-          - tts
-          multiple: false
-          reorder: false
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-warden/battery_warden.yaml
 mode: single
 max_exceeded: silent
 trigger:
 - platform: time_pattern
-  minutes: /15
+  hours: /1
+  id: scheduled_scan
 action:
 - action: todo.get_items
   target:
@@ -67,41 +60,60 @@ action:
     notify_devs: !input notify_target
     limit: !input threshold
     excluded_list: !input exclude_entities
-    worker_name: "{% set home = states.person | selectattr('state','eq','home') |
-      map(attribute='attributes.friendly_name') | list %} {% if home | length > 0
-      %}\n  {{ home | join(' and ') }}\n{% else %}\n  {# Find the single most recent
-      exit within the template scope #}\n  {% set recent = states.person | selectattr('state','ne','home')
-      | sort(attribute='last_changed', reverse=true) | first %}\n  {% if recent is
-      defined and recent is not none and (now() - recent.last_changed).total_seconds()
-      < 600 %}\n    {{ recent.attributes.friendly_name }}\n  {% else %}\n    none\n
-      \ {% endif %}\n{% endif %}"
-    all_battery_ids: "{{ states.sensor \n   | selectattr('attributes.device_class',
-      'defined') \n   | selectattr('attributes.device_class', 'eq', 'battery') \n
-      \  | map(attribute='entity_id') | list }}"
-    low_batteries: "{% set result = namespace(items=[]) %} {% for eid in all_battery_ids
-      %}\n  {% if eid not in excluded_list %}\n    {% set val = states(eid) %}\n    {%
-      if val not in ['unavailable', 'unknown'] and val | is_number and val | float
-      <= limit | float %}\n      {% set result.items = result.items + [eid] %}\n    {%
-      endif %}\n  {% endif %}\n{% endfor %} {{ result.items }}"
-    healthy_batteries: "{% set result = namespace(items=[]) %} {% for eid in all_battery_ids
-      %}\n  {% if eid not in excluded_list %}\n    {% set val = states(eid) %}\n    {%
-      if val not in ['unavailable', 'unknown'] and val | is_number and val | float
-      > limit | float %}\n      {% set result.items = result.items + [eid] %}\n    {%
-      endif %}\n  {% endif %}\n{% endfor %} {{ result.items }}"
+    home_persons: >-
+      {{ states.person | selectattr('state','eq','home')
+         | map(attribute='attributes.friendly_name') | list }}
+    recent_person: >-
+      {% set recent = states.person
+         | selectattr('state','ne','home')
+         | sort(attribute='last_changed', reverse=true)
+         | first | default(none) %}
+      {% if recent is not none and (now() - recent.last_changed).total_seconds() < 600 %}
+        {{ recent.attributes.friendly_name }}
+      {% endif %}
+    worker_name: >-
+      {% if home_persons | length > 0 %}
+        {{ home_persons | join(' and ') }}
+      {% elif recent_person | length > 0 %}
+        {{ recent_person }}
+      {% endif %}
+    has_worker: >-
+      {{ home_persons | length > 0 or recent_person | length > 0 }}
+    all_battery_ids: >-
+      {{ states.sensor
+         | selectattr('attributes.device_class', 'defined')
+         | selectattr('attributes.device_class', 'eq', 'battery')
+         | map(attribute='entity_id') | list }}
+    low_batteries: >-
+      {% set result = namespace(items=[]) %}
+      {% for eid in all_battery_ids %}
+        {% if eid not in excluded_list %}
+          {% set val = states(eid) %}
+          {% if val not in ['unavailable', 'unknown'] and val | is_number and val | float <= limit | float %}
+            {% set result.items = result.items + [eid] %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ result.items }}
+# --- Phase 1: Create/reopen tasks for low batteries ---
 - repeat:
     for_each: '{{ low_batteries }}'
     sequence:
     - variables:
         raw_name: '{{ state_attr(repeat.item, ''friendly_name'') }}'
-        dev_name: '{{ raw_name | regex_replace(find=''(?i)\s*(battery|level)'', replace='''')
-          | trim }}'
+        dev_name: >-
+          {{ raw_name | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='') | trim }}
         task_name: 'Replace Battery: {{ dev_name }}'
-        active_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-          ''eq'', task_name) | selectattr(''status'', ''eq'', ''needs_action'') |
-          map(attribute=''uid'') | list }}'
-        closed_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-          ''eq'', task_name) | selectattr(''status'', ''eq'', ''completed'') | map(attribute=''uid'')
-          | list }}'
+        active_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_name)
+             | selectattr('status', 'eq', 'needs_action')
+             | map(attribute='uid') | list }}
+        closed_uids: >-
+          {{ current_items[todo_target]['items']
+             | selectattr('summary', 'eq', task_name)
+             | selectattr('status', 'eq', 'completed')
+             | map(attribute='uid') | list }}
     - choose:
       - conditions: '{{ active_uids | length > 0 }}'
         sequence: []
@@ -119,39 +131,62 @@ action:
           entity_id: !input todo_list
         data:
           item: '{{ task_name }}'
+# --- Phase 2: Auto-close stale tasks by iterating open tasks (not all batteries) ---
+- variables:
+    open_battery_tasks: >-
+      {{ current_items[todo_target]['items']
+         | selectattr('status', 'eq', 'needs_action')
+         | selectattr('summary', 'match', '^Replace Battery:')
+         | list }}
 - repeat:
-    for_each: '{{ healthy_batteries }}'
+    for_each: '{{ open_battery_tasks }}'
     sequence:
     - variables:
-        raw_name: '{{ state_attr(repeat.item, ''friendly_name'') }}'
-        dev_name: '{{ raw_name | regex_replace(find=''(?i)\s*(battery|level)'', replace='''')
-          | trim }}'
-        task_name: 'Replace Battery: {{ dev_name }}'
-        notify_id: low_batt_{{ dev_name | slugify }}
-        target_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
-          ''eq'', task_name) | selectattr(''status'', ''eq'', ''needs_action'') |
-          map(attribute=''uid'') | list }}'
-    - if: '{{ target_uids | length > 0 }}'
+        task_dev_name: '{{ repeat.item.summary | replace(''Replace Battery: '', '''') }}'
+        notify_id: low_batt_{{ task_dev_name | slugify }}
+        # Find the battery entity whose cleaned name matches this task
+        matching_entity: >-
+          {% set result = namespace(eid='') %}
+          {% for eid in all_battery_ids %}
+            {% if eid not in excluded_list %}
+              {% set rn = state_attr(eid, 'friendly_name') %}
+              {% set dn = rn | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='') | trim %}
+              {% if dn == task_dev_name %}
+                {% set result.eid = eid %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ result.eid }}
+        is_healthy: >-
+          {% if matching_entity | length > 0 %}
+            {% set val = states(matching_entity) %}
+            {{ val not in ['unavailable', 'unknown'] and val | is_number and val | float > limit | float }}
+          {% else %}
+            false
+          {% endif %}
+    - if: '{{ is_healthy }}'
       then:
       - action: todo.update_item
         target:
           entity_id: !input todo_list
         data:
-          item: '{{ target_uids[0] }}'
+          item: '{{ repeat.item.uid }}'
           status: completed
-      - if: '{{ worker_name != ''none'' }}'
+      - if: '{{ has_worker }}'
         then:
         - repeat:
             for_each: '{{ notify_devs }}'
             sequence:
-            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
-                }}
+            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
               data:
                 title: "\U0001F50B Battery Recharged!"
-                message: "{% set dev = device_attr(repeat.item, 'name') | lower %}
-                  {% if worker_name | lower in dev %}\n  You slayed that task! ✅\n{%
-                  else %}\n  {{ worker_name }} just saved the {{ dev_name }}! ❤️\n{%
-                  endif %}"
+                message: >-
+                  {% set dev = device_attr(repeat.item, 'name') | lower %}
+                  {% if worker_name | lower in dev %}
+                    You slayed that task! ✅
+                  {% else %}
+                    {{ worker_name }} just saved the {{ task_dev_name }}! ❤️
+                  {% endif %}
                 data:
                   tag: gratitude_{{ notify_id }}
         - event: gratitude_award
