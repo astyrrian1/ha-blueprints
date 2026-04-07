@@ -1,0 +1,338 @@
+blueprint:
+  name: 'System: Mail & Package Warden V2.3 (State Guard)'
+  description: 'Nuclear Mail/Package management. * **Fix:** Prevents double-counting
+    mail after reboots (State Guard). * **Configured Volume:** Enforced volume control.
+    * **Circuit Breaker:** AI Rate Limits handled safely.
+
+    '
+  domain: automation
+  input:
+    announce_volume:
+      name: Announcement Volume
+      description: Volume level for voice broadcasts (0.0 to 1.0).
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.05
+          mode: slider
+    tts_engine:
+      name: Preferred TTS Provider
+      default: tts.google_ai_tts_3
+      selector:
+        entity:
+          domain:
+          - tts
+          reorder: false
+          multiple: false
+    usps_mail_sensor:
+      name: USPS Mail Sensor
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    usps_package_sensor:
+      name: USPS Packages
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    ups_package_sensor:
+      name: UPS Packages
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    fedex_package_sensor:
+      name: FedEx Packages
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    amazon_package_sensor:
+      name: Amazon Packages
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    package_count_sensor:
+      name: Doorbell Package Count
+      default: sensor.front_door_doorbell_package_count
+      selector:
+        entity:
+          domain:
+          - sensor
+          reorder: false
+          multiple: false
+    front_door_sensor:
+      name: Qolsys Front Door
+      default: binary_sensor.qolsys_panel_front_door
+      selector:
+        entity:
+          domain:
+          - binary_sensor
+          device_class:
+          - door
+          reorder: false
+          multiple: false
+    ai_task_entity:
+      name: AI Task Entity
+      selector:
+        entity:
+          domain:
+          - ai_task
+          reorder: false
+          multiple: false
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          reorder: false
+          multiple: false
+    notify_target:
+      name: Mobile Target
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/mail-package-warden/mail_package_warden.yaml
+mode: queued
+max: 10
+trigger:
+- platform: state
+  entity_id:
+  - !input usps_mail_sensor
+  - !input usps_package_sensor
+  - !input ups_package_sensor
+  - !input fedex_package_sensor
+  - !input amazon_package_sensor
+- platform: state
+  entity_id: !input package_count_sensor
+  for: 00:03:00
+  id: vision_drop
+- platform: state
+  entity_id: !input front_door_sensor
+  to: 'on'
+  id: door_interaction
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_items
+- variables:
+    vol: !input announce_volume
+    tts_ent: !input tts_engine
+    todo_target: !input todo_list
+    notify_devs: !input notify_target
+    ai_ent: !input ai_task_entity
+    p_sensor: !input package_count_sensor
+    s_usps_mail: !input usps_mail_sensor
+    s_usps_pkg: !input usps_package_sensor
+    s_ups_pkg: !input ups_package_sensor
+    s_fedex_pkg: !input fedex_package_sensor
+    s_amazon_pkg: !input amazon_package_sensor
+    current_p_count: '{{ states(p_sensor) | int(0) }}'
+    is_manual: '{{ trigger is not defined or trigger.platform is not defined or trigger.platform
+      == none }}'
+    trigger_id: '{{ trigger.entity_id if not is_manual else '''' }}'
+    at_home: "{{ states.person | selectattr('state', 'eq', 'home') \n   | map(attribute='attributes.friendly_name')
+      | list }}"
+    worker_name: '{{ at_home | join('' and '') if at_home | length > 0 else ''Justin
+      or Jaramie'' }}'
+    open_pkg_tasks: "{{ current_items[todo_target]['items'] \n   | selectattr('status',
+      'eq', 'needs_action') \n   | selectattr('summary', 'search', 'Retrieve .* Packages',
+      ignorecase=true) | list }}"
+- choose:
+  - conditions:
+    - condition: trigger
+      id: vision_drop
+    - condition: template
+      value_template: '{{ current_p_count > open_pkg_tasks | length }}'
+    sequence:
+    - action: ai_task.generate_data
+      continue_on_error: true
+      data:
+        entity_id: '{{ ai_ent }}'
+        task_name: Vision Verification
+        instructions: 'Persona: Sassy. Doorbell AI sees {{ current_p_count }} boxes.
+          Announce delivery.'
+        structure:
+          spoken_text:
+            selector:
+              text: {}
+      response_variable: ai_speech
+    - variables:
+        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
+          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  Doorbell confirms {{ current_p_count
+          }} packages are at the door.\n{% endif %}"
+    - action: script.system_smart_voice_broadcast
+      data:
+        message: '{{ final_speech }}'
+        tts_entity: '{{ tts_ent }}'
+        announce_volume: '{{ vol }}'
+  - conditions:
+    - condition: template
+      value_template: "{{ (not is_manual) and \n   (trigger_id in [s_usps_pkg, s_ups_pkg,
+        s_fedex_pkg, s_amazon_pkg]) }}\n"
+    - condition: template
+      value_template: '{{ trigger.to_state.state | int(0) > 0 }}'
+    sequence:
+    - variables:
+        carrier: '{% if trigger_id == s_usps_pkg %} USPS {% elif trigger_id == s_ups_pkg
+          %} UPS {% elif trigger_id == s_fedex_pkg %} FedEx {% elif trigger_id ==
+          s_amazon_pkg %} Amazon {% else %} Unknown {% endif %}'
+        task_title: Retrieve {{ carrier }} Packages
+        existing_task: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
+          ''eq'', task_title) | list | first | default(none) }}'
+    - choose:
+      - conditions: '{{ existing_task != none }}'
+        sequence:
+        - action: todo.update_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ existing_task.uid }}'
+            status: needs_action
+      - conditions: '{{ existing_task == none }}'
+        sequence:
+        - action: todo.add_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ task_title }}'
+    - action: ai_task.generate_data
+      continue_on_error: true
+      data:
+        entity_id: '{{ ai_ent }}'
+        task_name: Carrier Announcement
+        instructions: 'Persona: Sassy. {{ carrier }} just reported a delivery.'
+        structure:
+          spoken_text:
+            selector:
+              text: {}
+      response_variable: ai_speech
+    - variables:
+        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
+          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  {{ carrier }} has just
+          reported a new delivery.\n{% endif %}"
+    - action: script.system_smart_voice_broadcast
+      data:
+        message: '{{ final_speech }}'
+        tts_entity: '{{ tts_ent }}'
+        announce_volume: '{{ vol }}'
+  - conditions:
+    - condition: template
+      value_template: '{{ (not is_manual) and (trigger_id == s_usps_mail) }}'
+    - condition: template
+      value_template: '{{ trigger.from_state.state not in [''unavailable'', ''unknown'']
+        }}'
+    - condition: template
+      value_template: '{{ trigger.to_state.state | int(0) > trigger.from_state.state
+        | int(0) }}'
+    sequence:
+    - variables:
+        new_pieces: '{{ trigger.to_state.state | int(0) - trigger.from_state.state
+          | int(0) }}'
+        active_mail_task: "{{ current_items[todo_target]['items'] \n   | selectattr('status',
+          'eq', 'needs_action')\n   | selectattr('summary', 'search', '^Check Mail')
+          \n   | list | first | default(none) }}"
+    - choose:
+      - conditions: '{{ active_mail_task != none }}'
+        sequence:
+        - variables:
+            old_count: '{{ active_mail_task.summary | regex_findall(''\d+'') | first
+              | default(0) | int }}'
+            total_count: '{{ old_count + new_pieces }}'
+        - action: todo.update_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ active_mail_task.uid }}'
+            rename: Check Mail ({{ total_count }} pieces)
+      - conditions: '{{ active_mail_task == none }}'
+        sequence:
+        - action: todo.add_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: Check Mail ({{ new_pieces }} pieces)
+    - action: ai_task.generate_data
+      continue_on_error: true
+      data:
+        entity_id: '{{ ai_ent }}'
+        task_name: Mail Slay
+        instructions: 'Persona: Sassy. {{ new_pieces }} pieces of mail. Tell them.'
+        structure:
+          spoken_text:
+            selector:
+              text: {}
+      response_variable: ai_speech
+    - variables:
+        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
+          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  The mail has arrived.
+          {{ new_pieces }} pieces counted.\n{% endif %}"
+    - action: script.system_smart_voice_broadcast
+      data:
+        message: '{{ final_speech }}'
+        tts_entity: '{{ tts_ent }}'
+        announce_volume: '{{ vol }}'
+  - conditions:
+    - condition: trigger
+      id: door_interaction
+    sequence:
+    - wait_for_trigger:
+      - platform: state
+        entity_id: !input package_count_sensor
+        to: '0'
+        for: 00:01:00
+      timeout: 00:05:00
+      continue_on_timeout: false
+    - if: '{{ open_pkg_tasks | length > 0 }}'
+      then:
+      - repeat:
+          for_each: '{{ open_pkg_tasks }}'
+          sequence:
+          - action: todo.update_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ repeat.item.uid }}'
+              status: completed
+      - action: ai_task.generate_data
+        continue_on_error: true
+        data:
+          entity_id: '{{ ai_ent }}'
+          task_name: Retrieved Slay
+          instructions: 'Persona: Sassy. {{ worker_name }} cleared the porch. Thank
+            them.'
+          structure:
+            spoken_text:
+              selector:
+                text: {}
+        response_variable: ai_speech
+      - variables:
+          final_speech: "{% if ai_speech is defined and ai_speech.data is defined
+            %}\n  {{ ai_speech.data.spoken_text }}\n{% else %}\n  Packages retrieved
+            by {{ worker_name }}. Thank you!\n{% endif %}"
+      - action: script.system_smart_voice_broadcast
+        data:
+          message: '{{ final_speech }}'
+          tts_entity: '{{ tts_ent }}'
+          announce_volume: '{{ vol }}'
+      - event: gratitude_award
+        event_data:
+          person: '{{ worker_name }}'
+          chore: Package Retrieval

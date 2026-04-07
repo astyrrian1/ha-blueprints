@@ -1,0 +1,44 @@
+name: Bug Report
+description: Report an issue with a blueprint
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: blueprint
+    attributes:
+      label: Blueprint
+      description: Which blueprint is affected?
+      options:
+        - Battery Warden
+        - Battery Tasks
+        - Plant Warden
+        - Mail & Package Warden
+        - Sassy Task Mistress
+        - Smart Feeder Monitor
+        - Smart Litter Monitor
+        - Appliance Monitor
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: ha-version
+    attributes:
+      label: HA Version
+      description: Your Home Assistant version
+    validations:
+      required: true
+
+  - type: textarea
+    id: trace
+    attributes:
+      label: Automation Trace
+      description: Paste the automation trace (Settings → Automations → ⋮ → Traces)
+      render: yaml

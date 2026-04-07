@@ -1,0 +1,111 @@
+blueprint:
+  name: 'System: Individual Battery Tasks'
+  description: 'Scans for low batteries and creates **one task per device**.
+
+    Features: - **Per-Device Tasks**: Creates distinct items (e.g., "Replace Battery:
+    Kitchen", "Replace Battery: Hallway"). - **Smart De-Duplication**: Checks if "Replace
+    Battery: [Name]" exists. Ignores percentage changes to prevent duplicates. - **Summary
+    Notification**: Sends one notification summarizing all added items with their
+    percentages.
+
+    '
+  domain: automation
+  input:
+    trigger_time:
+      name: Check Time
+      default: 08:00:00
+      selector:
+        time: {}
+    battery_threshold:
+      name: Battery Threshold (%)
+      default: 5
+      selector:
+        number:
+          min: 1.0
+          max: 100.0
+          unit_of_measurement: '%'
+          mode: slider
+          step: 1.0
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          multiple: false
+          reorder: false
+    notify_devices:
+      name: Notify Devices
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+    exclude_sensors:
+      name: Exclude Sensors
+      default: []
+      selector:
+        entity:
+          domain:
+          - sensor
+          device_class:
+          - battery
+          multiple: true
+          reorder: false
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-tasks/battery_tasks.yaml
+variables:
+  threshold: !input battery_threshold
+  exclude: !input exclude_sensors
+  target_todo: !input todo_list
+  notify_devs: !input notify_devices
+  low_battery_entities: "{% set result = namespace(entities=[]) %} {% for state in
+    states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class',
+    'eq', 'battery') %}\n  {% if state.entity_id not in exclude and state.state |
+    is_number and state.state | float <= threshold | float %}\n    {% set result.entities
+    = result.entities + [state.entity_id] %}\n  {% endif %}\n{% endfor %} {{ result.entities
+    }}"
+trigger:
+- platform: time
+  at: !input trigger_time
+condition:
+- condition: template
+  value_template: '{{ low_battery_entities | count > 0 }}'
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_todo_items
+- repeat:
+    for_each: '{{ low_battery_entities }}'
+    sequence:
+    - variables:
+        sensor_name: '{{ state_attr(repeat.item, ''friendly_name'') | replace('' Battery
+          Level'', '''') | replace('' Battery'', '''') }}'
+        task_title: 'Replace Battery: {{ sensor_name }}'
+        existing_titles: '{{ current_todo_items[target_todo][''items''] | map(attribute=''summary'')
+          | list }}'
+    - if:
+      - condition: template
+        value_template: '{{ task_title not in existing_titles }}'
+      then:
+      - action: todo.add_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ task_title }}'
+- variables:
+    summary_text: "{% set result = namespace(text=[]) %} {% for entity_id in low_battery_entities
+      %}\n   {% set name = state_attr(entity_id, 'friendly_name') | replace(' Battery
+      Level', '') %}\n   {% set level = states(entity_id) %}\n   {% set result.text
+      = result.text + [name ~ ' (' ~ level ~ '%)'] %}\n{% endfor %} {{ result.text
+      | join(', ') }}"
+- repeat:
+    for_each: '{{ notify_devs }}'
+    sequence:
+    - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+      data:
+        title: "\U0001FAAB Low Batteries Detected"
+        message: 'Tasks added for: {{ summary_text }}'
+        data:
+          tag: battery_monitor
+          url: /todo
+          clickAction: /todo

@@ -1,0 +1,170 @@
+blueprint:
+  name: 'System: Smart Feeder Monitor V11 (Stable)'
+  description: 'Nuclear Feeder Management. * **Fix:** Implemented ''Entity ID Lookup''
+    for attribution to prevent string errors. * **Syntax:** Mapped inputs to variables
+    to prevent Jinja errors. * **Anti-Dupe:** Standardized logic to prevent task collisions.
+
+    '
+  domain: automation
+  input:
+    feeder_name:
+      name: Feeder Name
+      default: Feeder
+    food_status_sensor:
+      name: Food Status
+      selector:
+        entity:
+          domain:
+          - binary_sensor
+          device_class:
+          - problem
+          multiple: false
+          reorder: false
+    desiccant_sensor:
+      name: Desiccant Days
+      selector:
+        entity:
+          domain:
+          - sensor
+          device_class:
+          - duration
+          multiple: false
+          reorder: false
+    dispenser_sensor:
+      name: Dispenser/Jam
+      selector:
+        entity:
+          domain:
+          - binary_sensor
+          device_class:
+          - problem
+          multiple: false
+          reorder: false
+    desiccant_threshold:
+      name: Desiccant Threshold
+      default: 3
+      selector:
+        number:
+          min: 0.0
+          max: 30.0
+          unit_of_measurement: days
+          step: 1.0
+          mode: slider
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          multiple: false
+          reorder: false
+    notify_target:
+      name: Mobile Target
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-feeder-monitor/pet_feeder_monitor.yaml
+trigger:
+- platform: state
+  entity_id:
+  - !input food_status_sensor
+  - !input dispenser_sensor
+  - !input desiccant_sensor
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_items
+- variables:
+    todo_target: !input todo_list
+    notify_devs: !input notify_target
+    name: !input feeder_name
+    f_sensor: !input food_status_sensor
+    d_sensor: !input desiccant_sensor
+    j_sensor: !input dispenser_sensor
+    d_limit: !input desiccant_threshold
+    at_home: "{{ states.person | selectattr('state', 'eq', 'home') \n   | map(attribute='attributes.friendly_name')
+      | list }}"
+    recent_exit_ids: "{{ states.person \n   | selectattr('state', 'ne', 'home') \n
+      \  | sort(attribute='last_changed', reverse=true) \n   | map(attribute='entity_id')
+      \n   | list }}"
+    worker_name: "{% if at_home | length > 0 %}\n  {{ at_home | join(' and ') }}\n{%
+      elif recent_exit_ids | length > 0 and (now() - states[recent_exit_ids[0]].last_changed).total_seconds()
+      < 600 %}\n  {{ state_attr(recent_exit_ids[0], 'friendly_name') }}\n{% else %}
+      none {% endif %}"
+    checks:
+    - type: food
+      is_issue: '{{ is_state(f_sensor, ''on'') }}'
+      task: Refill {{ name }}
+      id: feeder_{{ name | slugify }}_food
+    - type: desiccant
+      is_issue: '{{ states(d_sensor) | float(99) <= d_limit | float }}'
+      task: 'Replace Desiccant: {{ name }}'
+      id: feeder_{{ name | slugify }}_desi
+    - type: jam
+      is_issue: '{{ is_state(j_sensor, ''on'') }}'
+      task: 'Fix Jam: {{ name }}'
+      id: feeder_{{ name | slugify }}_jam
+- repeat:
+    for_each: '{{ checks }}'
+    sequence:
+    - variables:
+        active_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+          'eq', repeat.item.task) \n   | selectattr('status', 'eq', 'needs_action')
+          \n   | map(attribute='uid') | list }}"
+        closed_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+          'eq', repeat.item.task) \n   | selectattr('status', 'eq', 'completed') \n
+          \  | map(attribute='uid') | list }}"
+    - choose:
+      - conditions: '{{ repeat.item.is_issue == ''True'' }}'
+        sequence:
+        - choose:
+          - conditions: '{{ active_uids | length > 0 }}'
+            sequence: []
+          - conditions: '{{ closed_uids | length > 0 }}'
+            sequence:
+            - action: todo.update_item
+              target:
+                entity_id: !input todo_list
+              data:
+                item: '{{ closed_uids[0] }}'
+                status: needs_action
+          default:
+          - action: todo.add_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ repeat.item.task }}'
+      - conditions: '{{ repeat.item.is_issue == ''False'' }}'
+        sequence:
+        - if: '{{ active_uids | length > 0 }}'
+          then:
+          - action: todo.update_item
+            target:
+              entity_id: !input todo_list
+            data:
+              item: '{{ active_uids[0] }}'
+              status: completed
+          - if: '{{ worker_name != ''none'' }}'
+            then:
+            - repeat:
+                for_each: '{{ notify_devs }}'
+                sequence:
+                - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') |
+                    slugify }}
+                  data:
+                    title: "\U0001F43E Feeder Serviced"
+                    message: "{% set dev = device_attr(repeat.item, 'name') | lower
+                      %} {% if worker_name | lower in dev %}\n  You slayed that maintenance!
+                      ✅\n{% else %}\n  {{ worker_name }} just fixed the {{ repeat.item.type
+                      }} issue! ❤️\n{% endif %}"
+                    data:
+                      tag: gratitude_{{ repeat.item.id }}
+            - event: gratitude_award
+              event_data:
+                person: '{{ worker_name }}'
+                chore: Feeder Service ({{ repeat.item.type }})
+        - action: persistent_notification.dismiss
+          data:
+            notification_id: '{{ repeat.item.id }}'

@@ -1,0 +1,217 @@
+blueprint:
+  name: 'System: Smart Appliance Monitor V13 (Nuclear)'
+  description: 'Nuclear Appliance Management. * **Features:** Finish Sensor + Power
+    Sensor + Blocking Entity. * **Voice:** Configurable Volume + TTS. * **AI Sass:**
+    Generates sassy announcements (with Circuit Breaker). * **Nag:** Repeats alerts
+    every hour if ignored. * **Alerts:** Voice, Mobile, and Signal.
+
+    '
+  domain: automation
+  input:
+    appliance_name:
+      name: Appliance Name
+      default: Dryer
+    finish_sensor:
+      name: Finish Sensor
+      description: Binary Sensor that turns ON when complete (e.g. Washer Job State).
+      selector:
+        entity:
+          domain:
+          - binary_sensor
+          multiple: false
+          reorder: false
+    power_sensor:
+      name: Power Status Sensor
+      description: Turns OFF when the machine is powered down/unloaded.
+      selector:
+        entity:
+          domain:
+          - switch
+          - binary_sensor
+          multiple: false
+          reorder: false
+    block_entity:
+      name: Blocking Entity (Optional)
+      description: If ON, skips alerts (e.g. Dryer running blocks Washer).
+      default: []
+      selector:
+        entity:
+          multiple: false
+          reorder: false
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          multiple: false
+          reorder: false
+    notify_target:
+      name: Mobile Targets
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+    ai_task_entity:
+      name: AI Generator
+      default: ai_task.google_ai_task
+      selector:
+        entity:
+          domain:
+          - ai_task
+          multiple: false
+          reorder: false
+    tts_engine:
+      name: TTS Entity
+      default: tts.google_ai_tts_3
+      selector:
+        entity:
+          domain:
+          - tts
+          multiple: false
+          reorder: false
+    announce_volume:
+      name: Announcement Volume
+      default: 0.6
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.05
+          mode: slider
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/appliance-monitor/appliance_monitor.yaml
+variables:
+  name: !input appliance_name
+  finish_ent: !input finish_sensor
+  power_ent: !input power_sensor
+  block_ent: !input block_entity
+  todo_target: !input todo_list
+  notify_devs: !input notify_target
+  ai_ent: !input ai_task_entity
+  tts_ent: !input tts_engine
+  vol: !input announce_volume
+  task_title: Empty {{ name }}
+mode: restart
+max_exceeded: silent
+trigger:
+- platform: state
+  entity_id: !input finish_sensor
+  to: 'on'
+  id: finished
+- platform: state
+  entity_id: !input power_sensor
+  to: 'off'
+  id: cleared
+- platform: time_pattern
+  hours: /1
+  id: nag
+condition: []
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_items
+- choose:
+  - conditions:
+    - condition: state
+      entity_id: !input power_sensor
+      state: 'off'
+    sequence:
+    - repeat:
+        for_each: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+          'eq', task_title) \n   | selectattr('status', 'eq', 'needs_action') \n   |
+          map(attribute='uid') | list }}"
+        sequence:
+        - action: todo.update_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ repeat.item }}'
+            status: completed
+  - conditions:
+    - condition: state
+      entity_id: !input finish_sensor
+      state: 'on'
+    - condition: state
+      entity_id: !input power_sensor
+      state: 'on'
+    - condition: template
+      value_template: "{% if block_ent != none and block_ent != '' and block_ent !=
+        [] %}\n  {{ is_state(block_ent, 'off') }}\n{% else %}\n  true\n{% endif %}"
+    sequence:
+    - variables:
+        open_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+          'eq', task_title) \n   | selectattr('status', 'eq', 'needs_action') \n   |
+          map(attribute='uid') | list }}"
+        closed_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+          'eq', task_title) \n   | selectattr('status', 'eq', 'completed') \n   |
+          map(attribute='uid') | list }}"
+        has_open: '{{ open_uids | length > 0 }}'
+        has_closed: '{{ closed_uids | length > 0 }}'
+    - if: '{{ has_closed and (not has_open) }}'
+      then:
+      - action: todo.update_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ closed_uids[0] }}'
+          status: needs_action
+    - if: '{{ (not has_closed) and (not has_open) }}'
+      then:
+      - action: todo.add_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ task_title }}'
+    - action: ai_task.generate_data
+      continue_on_error: true
+      data:
+        entity_id: '{{ ai_ent }}'
+        task_name: Appliance Finish
+        instructions: 'Persona: Sassy Assistant. Context: The {{ name }} has finished
+          its cycle. Trigger: {{ trigger.id }} (Note: ''nag'' means it''s been sitting
+          there). Task: Announce it needs to be emptied. Tone: If ''nag'', be impatient.
+          If ''finished'', be helpful. Format: Short sentence for TTS.
+
+          '
+        structure:
+          spoken_text:
+            selector:
+              text: {}
+      response_variable: ai_speech
+    - variables:
+        final_speech: "{% if ai_speech is defined and ai_speech.data is defined %}\n
+          \ {{ ai_speech.data.spoken_text }}\n{% else %}\n  The {{ name | lower }}
+          is finished. Please empty it.\n{% endif %}"
+    - action: script.system_smart_voice_broadcast
+      data:
+        message: '{{ final_speech }}'
+        tts_entity: '{{ tts_ent }}'
+        announce_volume: '{{ vol }}'
+    - if:
+      - condition: time
+        after: 09:00:00
+        before: '23:00:00'
+      then:
+      - repeat:
+          for_each: '{{ notify_devs }}'
+          sequence:
+          - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
+              }}
+            data:
+              title: '{{ name }} Finished'
+              message: '{{ final_speech }}'
+              data:
+                tag: '{{ name | slugify }}_finished'
+                ttl: 3600
+                priority: high
+      - if:
+        - condition: template
+          value_template: '{{ ''Downstairs'' in name }}'
+        then:
+        - action: notify.signal
+          data:
+            message: '{{ name }} is Finished'
+            title: '{{ name }} is Finished'
+            target: group.ZDNJcWhIMG1pUnphMGp6RUZldXplcU0zSE9LenFRL1U4ZVhaM0VkRmNSMD0=
+          enabled: true

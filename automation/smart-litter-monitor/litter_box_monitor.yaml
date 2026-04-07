@@ -1,0 +1,194 @@
+blueprint:
+  name: 'System: Smart Litter Monitor V15.1 (Hybrid)'
+  description: 'Complete Litter Management. * **Cleanliness:** Monitors ''Empty''
+    vs ''Full'' status (V14 Core). * **Refill:** Monitors ''Insufficient'' litter
+    levels (New). * **Fix:** Corrected YAML indentation in logic blocks. * **Anti-Dupe:**
+    Manages two distinct tasks without collision.
+
+    '
+  domain: automation
+  input:
+    litter_box_name:
+      name: Litter Box Name
+      default: Litter Box
+    status_sensor:
+      name: Cleanliness Sensor
+      description: Detects if box is Full
+      selector:
+        entity:
+          domain:
+          - sensor
+          multiple: false
+          reorder: false
+    litter_level_sensor:
+      name: Litter Level Sensor
+      description: Detects if litter is Insufficient
+      default: sensor.jq01009g24300010823_cat_litter_state
+      selector:
+        entity:
+          domain:
+          - sensor
+          multiple: false
+          reorder: false
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          multiple: false
+          reorder: false
+    notify_target:
+      name: Mobile Target
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-litter-monitor/litter_box_monitor.yaml
+trigger:
+- platform: state
+  entity_id:
+  - !input status_sensor
+  - !input litter_level_sensor
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_items
+- variables:
+    todo_target: !input todo_list
+    notify_devs: !input notify_target
+    name: !input litter_box_name
+    status_ent: !input status_sensor
+    level_ent: !input litter_level_sensor
+    clean_task_title: Empty {{ name }}
+    clean_notify_id: litter_{{ name | slugify }}_full
+    refill_task_title: 'Refill Litter: {{ name }}'
+    refill_notify_id: litter_{{ name | slugify }}_refill
+    worker_name: "{% set home = states.person | selectattr('state','eq','home') |
+      map(attribute='attributes.friendly_name') | list %} {% if home | length > 0
+      %}\n  {{ home | join(' and ') }}\n{% else %}\n  {% set recent = states.person
+      | selectattr('state','ne','home') | sort(attribute='last_changed', reverse=true)
+      | first %}\n  {% if recent is defined and recent is not none and (now() - recent.last_changed).total_seconds()
+      < 600 %}\n    {{ recent.attributes.friendly_name }}\n  {% else %}\n    none\n
+      \ {% endif %}\n{% endif %}"
+- variables:
+    active_clean_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
+      ''eq'', clean_task_title) | selectattr(''status'', ''eq'', ''needs_action'')
+      | map(attribute=''uid'') | list }}'
+    closed_clean_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
+      ''eq'', clean_task_title) | selectattr(''status'', ''eq'', ''completed'') |
+      map(attribute=''uid'') | list }}'
+- choose:
+  - conditions: '{{ is_state(status_ent, ''full'') }}'
+    sequence:
+    - choose:
+      - conditions: '{{ active_clean_uids | length > 0 }}'
+        sequence: []
+      - conditions: '{{ closed_clean_uids | length > 0 }}'
+        sequence:
+        - action: todo.update_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ closed_clean_uids[0] }}'
+            status: needs_action
+      default:
+      - action: todo.add_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ clean_task_title }}'
+  - conditions: '{{ is_state(status_ent, ''empty'') or is_state(status_ent, ''ok'')
+      }}'
+    sequence:
+    - if: '{{ active_clean_uids | length > 0 }}'
+      then:
+      - action: todo.update_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ active_clean_uids[0] }}'
+          status: completed
+      - if: '{{ worker_name != ''none'' }}'
+        then:
+        - repeat:
+            for_each: '{{ notify_devs }}'
+            sequence:
+            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
+                }}
+              data:
+                title: ✨ Litter Cleaned!
+                message: "{% set dev = device_attr(repeat.item, 'name') | lower %}
+                  {% if worker_name | lower in dev %}\n  You slayed that task! ✅\n{%
+                  else %}\n  {{ worker_name }} just cleaned the {{ name }}! ❤️\n{%
+                  endif %}"
+                data:
+                  tag: gratitude_{{ clean_notify_id }}
+        - event: gratitude_award
+          event_data:
+            person: '{{ worker_name }}'
+            chore: Litter Box (Cleaning)
+    - action: persistent_notification.dismiss
+      data:
+        notification_id: '{{ clean_notify_id }}'
+- variables:
+    active_refill_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
+      ''eq'', refill_task_title) | selectattr(''status'', ''eq'', ''needs_action'')
+      | map(attribute=''uid'') | list }}'
+    closed_refill_uids: '{{ current_items[todo_target][''items''] | selectattr(''summary'',
+      ''eq'', refill_task_title) | selectattr(''status'', ''eq'', ''completed'') |
+      map(attribute=''uid'') | list }}'
+- choose:
+  - conditions: '{{ is_state(level_ent, ''insufficient'') }}'
+    sequence:
+    - choose:
+      - conditions: '{{ active_refill_uids | length > 0 }}'
+        sequence: []
+      - conditions: '{{ closed_refill_uids | length > 0 }}'
+        sequence:
+        - action: todo.update_item
+          target:
+            entity_id: !input todo_list
+          data:
+            item: '{{ closed_refill_uids[0] }}'
+            status: needs_action
+      default:
+      - action: todo.add_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ refill_task_title }}'
+  - conditions: '{{ not is_state(level_ent, ''insufficient'') and not is_state(level_ent,
+      ''unavailable'') and not is_state(level_ent, ''unknown'') }}'
+    sequence:
+    - if: '{{ active_refill_uids | length > 0 }}'
+      then:
+      - action: todo.update_item
+        target:
+          entity_id: !input todo_list
+        data:
+          item: '{{ active_refill_uids[0] }}'
+          status: completed
+      - if: '{{ worker_name != ''none'' }}'
+        then:
+        - repeat:
+            for_each: '{{ notify_devs }}'
+            sequence:
+            - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify
+                }}
+              data:
+                title: "\U0001F3D6️ Litter Refilled!"
+                message: "{% set dev = device_attr(repeat.item, 'name') | lower %}
+                  {% if worker_name | lower in dev %}\n  Top-up complete! ✅\n{% else
+                  %}\n  {{ worker_name }} just refilled the {{ name }}! ❤️\n{% endif
+                  %}"
+                data:
+                  tag: gratitude_{{ refill_notify_id }}
+        - event: gratitude_award
+          event_data:
+            person: '{{ worker_name }}'
+            chore: Litter Box (Refill)
+    - action: persistent_notification.dismiss
+      data:
+        notification_id: '{{ refill_notify_id }}'

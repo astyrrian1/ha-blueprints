@@ -1,0 +1,159 @@
+blueprint:
+  name: 'System: Global Plant Warden V6.0 (Hybrid Scanner)'
+  description: 'Nuclear Plant Management. * **Hybrid Engine:** Reacts instantly to
+    changes, BUT also scans every 30m to catch "missed" plants. * **Safety Net:**
+    Runs on Home Assistant Start to check status immediately. * **Atomic Logic:**
+    Fixed attribution to prevent crashes. * **Anti-Dupe:** Safely scans repeatedly
+    without creating duplicate tasks.
+
+    '
+  domain: automation
+  input:
+    plant_entities:
+      name: Plants to Monitor
+      selector:
+        entity:
+          domain:
+          - plant
+          multiple: true
+          reorder: false
+    todo_list:
+      name: To-Do List
+      selector:
+        entity:
+          domain:
+          - todo
+          reorder: false
+          multiple: false
+    notify_target:
+      name: Mobile Target
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+    tts_engine:
+      name: TTS Entity
+      default: tts.google_ai_tts_3
+      selector:
+        entity:
+          domain:
+          - tts
+          reorder: false
+          multiple: false
+    exclude_entities:
+      name: Excluded Plants
+      default: []
+      selector:
+        entity:
+          domain:
+          - plant
+          multiple: true
+          reorder: false
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/plant-warden/plant_warden.yaml
+mode: parallel
+max: 10
+trigger:
+- platform: state
+  entity_id: !input plant_entities
+  to: problem
+  for: 00:05:00
+  id: state_change
+- platform: state
+  entity_id: !input plant_entities
+  to: ok
+  for: 00:05:00
+  id: state_change
+- platform: time_pattern
+  minutes: /30
+  id: scheduled_scan
+- platform: homeassistant
+  event: start
+  id: startup_scan
+action:
+- action: todo.get_items
+  target:
+    entity_id: !input todo_list
+  response_variable: current_items
+- variables:
+    todo_target: !input todo_list
+    notify_devs: !input notify_target
+    excluded_list: !input exclude_entities
+    monitored_plants: !input plant_entities
+    target_list: "{% if trigger.id == 'state_change' %}\n  {{ [trigger.entity_id]
+      }}\n{% else %}\n  {{ monitored_plants }}\n{% endif %}"
+    worker_name: "{% set home = states.person | selectattr('state','eq','home') |
+      map(attribute='attributes.friendly_name') | list %} {% if home | length > 0
+      %}\n  {{ home | join(' and ') }}\n{% else %}\n  {% set recent = states.person
+      | selectattr('state','ne','home') | sort(attribute='last_changed', reverse=true)
+      | first %}\n  {% if recent is defined and recent is not none and (now() - recent.last_changed).total_seconds()
+      < 600 %}\n    {{ recent.attributes.friendly_name }}\n  {% else %}\n    none\n
+      \ {% endif %}\n{% endif %}"
+- repeat:
+    for_each: '{{ target_list }}'
+    sequence:
+    - if: '{{ repeat.item not in excluded_list }}'
+      then:
+      - variables:
+          entity: '{{ repeat.item }}'
+          current_state: '{{ states(entity) }}'
+          raw_name: '{{ state_attr(entity, ''friendly_name'') }}'
+          area: '{{ area_name(entity) | default(''Unknown'') }}'
+          task_name: Water {{ raw_name }} ({{ area }})
+          active_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+            'eq', task_name) \n   | selectattr('status', 'eq', 'needs_action') \n
+            \  | map(attribute='uid') | list }}"
+          closed_uids: "{{ current_items[todo_target]['items'] \n   | selectattr('summary',
+            'eq', task_name) \n   | selectattr('status', 'eq', 'completed') \n   |
+            map(attribute='uid') | list }}"
+      - choose:
+        - conditions: '{{ current_state == ''problem'' }}'
+          sequence:
+          - choose:
+            - conditions: '{{ active_uids | length > 0 }}'
+              sequence: []
+            - conditions: '{{ closed_uids | length > 0 }}'
+              sequence:
+              - action: todo.update_item
+                target:
+                  entity_id: !input todo_list
+                data:
+                  item: '{{ closed_uids[0] }}'
+                  status: needs_action
+            default:
+            - action: todo.add_item
+              target:
+                entity_id: !input todo_list
+              data:
+                item: '{{ task_name }}'
+        - conditions: '{{ current_state == ''ok'' }}'
+          sequence:
+          - if: '{{ active_uids | length > 0 }}'
+            then:
+            - action: todo.update_item
+              target:
+                entity_id: !input todo_list
+              data:
+                item: '{{ active_uids[0] }}'
+                status: completed
+            - if: '{{ worker_name != ''none'' }}'
+              then:
+              - repeat:
+                  for_each: '{{ notify_devs }}'
+                  sequence:
+                  - action: notify.mobile_app_{{ device_attr(repeat.item, 'name')
+                      | slugify }}
+                    data:
+                      title: "\U0001F33F Plant Saved!"
+                      message: "{% set dev = device_attr(repeat.item, 'name') | lower
+                        %} {% if worker_name | lower in dev %}\n  Thank you! You slayed
+                        that task. ✅\n{% else %}\n  {{ worker_name }} just saved the
+                        {{ raw_name }}! ❤️\n{% endif %}"
+                      data:
+                        tag: gratitude_{{ entity | slugify }}
+              - event: gratitude_award
+                event_data:
+                  person: '{{ worker_name }}'
+                  chore: Watering {{ raw_name }}
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: plant_{{ entity | slugify }}

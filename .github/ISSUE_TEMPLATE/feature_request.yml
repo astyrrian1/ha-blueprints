@@ -1,0 +1,36 @@
+name: Feature Request
+description: Suggest an improvement or new blueprint
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: blueprint
+    attributes:
+      label: Blueprint
+      description: Which blueprint does this relate to? (or "New Blueprint")
+      options:
+        - Battery Warden
+        - Battery Tasks
+        - Plant Warden
+        - Mail & Package Warden
+        - Sassy Task Mistress
+        - Smart Feeder Monitor
+        - Smart Litter Monitor
+        - Appliance Monitor
+        - New Blueprint
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What would you like to see?
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: How would you use this feature?
