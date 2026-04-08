@@ -9,6 +9,7 @@ blueprint:
     * **Gratitude:** Credits the person who emptied the appliance.
     * **Alerts:** Voice, Mobile, and Signal.
   domain: automation
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/appliance-monitor/appliance_monitor.yaml
   input:
     appliance_name:
       name: Appliance Name
