@@ -8,6 +8,7 @@ blueprint:
     * **Debounce:** Triggers use `for:` to ignore momentary sensor flickers.
     * **Smart Desiccant:** Only fires on threshold crossing, not every update.
   domain: automation
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-feeder-monitor/pet_feeder_monitor.yaml
   input:
     feeder_name:
       name: Feeder Name

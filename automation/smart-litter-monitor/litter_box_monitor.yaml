@@ -9,6 +9,7 @@ blueprint:
     * **Queued Mode:** Handles simultaneous sensor changes without dropping events.
     * **Anti-Dupe:** Manages two distinct tasks without collision.
   domain: automation
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-litter-monitor/litter_box_monitor.yaml
   input:
     litter_box_name:
       name: Litter Box Name

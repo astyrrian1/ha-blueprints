@@ -8,6 +8,7 @@ blueprint:
     * **Circuit Breaker:** AI Rate Limits handled safely.
     * **Quiet Hours:** Respects do-not-disturb window for TTS broadcasts.
   domain: automation
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/mail-package-warden/mail_package_warden.yaml
   input:
     announce_volume:
       name: Announcement Volume

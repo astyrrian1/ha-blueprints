@@ -8,6 +8,7 @@ blueprint:
     * **Efficient:** Hourly full scan + instant numeric_state trigger on threshold crossing.
     * **Smart Recovery:** Iterates open tasks (not all batteries) for efficient auto-close.
   domain: automation
+  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-warden/battery_warden.yaml
   input:
     threshold:
       name: Low Threshold (%)
