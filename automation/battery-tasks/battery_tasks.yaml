@@ -1,10 +1,10 @@
 blueprint:
-  name: 'System: Individual Battery Tasks V2 (Smart)'
+  name: 'System: Individual Battery Tasks V2.1 (Durable Cleanup)'
   description: >-
     Scans for low batteries and creates one task per device.
     * **Per-Device Tasks:** Creates distinct items (e.g., "Replace Battery: Kitchen").
     * **Smart De-Dupe:** Only checks `needs_action` tasks (not completed) to allow re-creation.
-    * **Auto-Close:** Completed tasks when battery recovers above threshold.
+    * **Auto-Close:** Completed tasks when battery recovers above threshold, even after exclusions or friendly-name drift.
     * **Anchored Regex:** Strips "Battery Level" or "Battery" from end of names only.
     * **Smart Notify:** Only sends notification when new tasks were actually created.
   domain: automation
@@ -123,20 +123,59 @@ action:
     - variables:
         task_dev_name: '{{ repeat.item.summary | replace(''Replace Battery: '', '''') }}'
         matching_entity: >-
+          {% macro battery_title(value) -%}
+            {{- value | default('', true)
+               | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='')
+               | trim -}}
+          {%- endmacro %}
+          {% macro match_key(value) -%}
+            {{- value | default('', true) | lower
+               | regex_replace(find='(?i)\b(battery|level|sensor)\b', replace=' ')
+               | regex_replace(find='[^a-z0-9]+', replace=' ')
+               | regex_replace(find='\s+', replace=' ')
+               | trim -}}
+          {%- endmacro %}
           {% set result = namespace(eid='') %}
+          {% set task_key = match_key(task_dev_name) | trim %}
           {% for eid in all_battery_ids %}
-            {% if eid not in exclude %}
-              {% set rn = state_attr(eid, 'friendly_name') %}
-              {% set dn = rn | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='') | trim %}
-              {% if dn == task_dev_name %}
+            {% if result.eid | length == 0 %}
+              {% set rn = state_attr(eid, 'friendly_name') | default('', true) %}
+              {% set dn = battery_title(rn) | trim %}
+              {% if task_key | length > 0 and match_key(dn) | trim == task_key %}
                 {% set result.eid = eid %}
               {% endif %}
             {% endif %}
           {% endfor %}
-          {{ result.eid }}
+          {% for eid in all_battery_ids %}
+            {% if result.eid | length == 0 %}
+              {% set rn = state_attr(eid, 'friendly_name') | default('', true) %}
+              {% set dn_key = match_key(battery_title(rn) | trim) | trim %}
+              {% set eid_key = match_key(eid | regex_replace(find='^[^.]+\.', replace='')) | trim %}
+              {% set alias = namespace(found=false) %}
+              {% if task_key | length >= 12 and ((dn_key | length > 0 and (task_key in dn_key or dn_key in task_key)) or (eid_key | length > 0 and (task_key in eid_key or eid_key in task_key))) %}
+                {% set alias.found = true %}
+              {% endif %}
+              {% set did = device_id(eid) %}
+              {% if not alias.found and did %}
+                {% for sibling in device_entities(did) %}
+                  {% set sibling_name = state_attr(sibling, 'friendly_name') | default('', true) %}
+                  {% set sibling_name_key = match_key(sibling_name) | trim %}
+                  {% set sibling_eid_key = match_key(sibling | regex_replace(find='^[^.]+\.', replace='')) | trim %}
+                  {% if task_key | length >= 12 and ((sibling_name_key | length > 0 and (task_key == sibling_name_key or task_key in sibling_name_key or sibling_name_key in task_key)) or (sibling_eid_key | length > 0 and (task_key == sibling_eid_key or task_key in sibling_eid_key or sibling_eid_key in task_key))) %}
+                    {% set alias.found = true %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% if alias.found %}
+                {% set result.eid = eid %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{- result.eid -}}
         is_healthy: >-
-          {% if matching_entity | length > 0 %}
-            {% set val = states(matching_entity) %}
+          {% set eid = matching_entity | trim %}
+          {% if eid | length > 0 %}
+            {% set val = states(eid) %}
             {{ val not in ['unavailable', 'unknown'] and val | is_number and val | float > threshold | float }}
           {% else %}
             false
