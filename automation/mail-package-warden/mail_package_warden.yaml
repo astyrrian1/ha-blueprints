@@ -123,7 +123,6 @@ blueprint:
       default: '07:00:00'
       selector:
         time: {}
-  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/mail-package-warden/mail_package_warden.yaml
 mode: queued
 max: 10
 trigger:

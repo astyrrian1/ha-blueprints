@@ -96,7 +96,6 @@ blueprint:
           max: 1.0
           step: 0.05
           mode: slider
-  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/smart-feeder-monitor/pet_feeder_monitor.yaml
 mode: queued
 max: 5
 trigger:

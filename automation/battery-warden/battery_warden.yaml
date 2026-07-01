@@ -1,11 +1,12 @@
 blueprint:
-  name: 'System: Global Battery Warden V13.0 (Atomic)'
+  name: 'System: Global Battery Warden V13.1 (Durable Cleanup)'
   description: >-
     Scans ALL battery sensors.
     * **Atomic Logic:** Calculates attribution in one step to prevent object errors.
     * **Anti-Dupe:** Checks for Active tasks before creating new ones.
+    * **Durable Cleanup:** Auto-closes legacy tasks even after battery sensors are excluded or friendly names drift.
     * **Gratitude:** Attributes maintenance to specific residents.
-    * **Efficient:** Hourly full scan + instant numeric_state trigger on threshold crossing.
+    * **Efficient:** Hourly full scan.
     * **Smart Recovery:** Iterates open tasks (not all batteries) for efficient auto-close.
   domain: automation
   source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-warden/battery_warden.yaml
@@ -44,7 +45,6 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
-  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-warden/battery_warden.yaml
 mode: single
 max_exceeded: silent
 trigger:
@@ -145,22 +145,60 @@ action:
     - variables:
         task_dev_name: '{{ repeat.item.summary | replace(''Replace Battery: '', '''') }}'
         notify_id: low_batt_{{ task_dev_name | slugify }}
-        # Find the battery entity whose cleaned name matches this task
         matching_entity: >-
+          {% macro battery_title(value) -%}
+            {{- value | default('', true)
+               | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='')
+               | trim -}}
+          {%- endmacro %}
+          {% macro match_key(value) -%}
+            {{- value | default('', true) | lower
+               | regex_replace(find='(?i)\b(battery|level|sensor)\b', replace=' ')
+               | regex_replace(find='[^a-z0-9]+', replace=' ')
+               | regex_replace(find='\s+', replace=' ')
+               | trim -}}
+          {%- endmacro %}
           {% set result = namespace(eid='') %}
+          {% set task_key = match_key(task_dev_name) | trim %}
           {% for eid in all_battery_ids %}
-            {% if eid not in excluded_list %}
-              {% set rn = state_attr(eid, 'friendly_name') %}
-              {% set dn = rn | regex_replace(find='(?i)\s*(battery\s*level|battery)\s*$', replace='') | trim %}
-              {% if dn == task_dev_name %}
+            {% if result.eid | length == 0 %}
+              {% set rn = state_attr(eid, 'friendly_name') | default('', true) %}
+              {% set dn = battery_title(rn) | trim %}
+              {% if task_key | length > 0 and match_key(dn) | trim == task_key %}
                 {% set result.eid = eid %}
               {% endif %}
             {% endif %}
           {% endfor %}
-          {{ result.eid }}
+          {% for eid in all_battery_ids %}
+            {% if result.eid | length == 0 %}
+              {% set rn = state_attr(eid, 'friendly_name') | default('', true) %}
+              {% set dn_key = match_key(battery_title(rn) | trim) | trim %}
+              {% set eid_key = match_key(eid | regex_replace(find='^[^.]+\.', replace='')) | trim %}
+              {% set alias = namespace(found=false) %}
+              {% if task_key | length >= 12 and ((dn_key | length > 0 and (task_key in dn_key or dn_key in task_key)) or (eid_key | length > 0 and (task_key in eid_key or eid_key in task_key))) %}
+                {% set alias.found = true %}
+              {% endif %}
+              {% set did = device_id(eid) %}
+              {% if not alias.found and did %}
+                {% for sibling in device_entities(did) %}
+                  {% set sibling_name = state_attr(sibling, 'friendly_name') | default('', true) %}
+                  {% set sibling_name_key = match_key(sibling_name) | trim %}
+                  {% set sibling_eid_key = match_key(sibling | regex_replace(find='^[^.]+\.', replace='')) | trim %}
+                  {% if task_key | length >= 12 and ((sibling_name_key | length > 0 and (task_key == sibling_name_key or task_key in sibling_name_key or sibling_name_key in task_key)) or (sibling_eid_key | length > 0 and (task_key == sibling_eid_key or task_key in sibling_eid_key or sibling_eid_key in task_key))) %}
+                    {% set alias.found = true %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% if alias.found %}
+                {% set result.eid = eid %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{- result.eid -}}
         is_healthy: >-
-          {% if matching_entity | length > 0 %}
-            {% set val = states(matching_entity) %}
+          {% set eid = matching_entity | trim %}
+          {% if eid | length > 0 %}
+            {% set val = states(eid) %}
             {{ val not in ['unavailable', 'unknown'] and val | is_number and val | float > limit | float }}
           {% else %}
             false
