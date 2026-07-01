@@ -50,7 +50,6 @@ blueprint:
           - battery
           multiple: true
           reorder: false
-  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-tasks/battery_tasks.yaml
 variables:
   threshold: !input battery_threshold
   exclude: !input exclude_sensors

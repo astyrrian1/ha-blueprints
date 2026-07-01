@@ -45,7 +45,6 @@ blueprint:
         device:
           integration: mobile_app
           multiple: true
-  source_url: https://github.com/astyrrian1/ha-blueprints/blob/main/automation/battery-warden/battery_warden.yaml
 mode: single
 max_exceeded: silent
 trigger:

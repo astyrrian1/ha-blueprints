@@ -13,19 +13,7 @@ lint:
 
 validate:
 	@echo "🔍 Validating blueprint schemas..."
-	@for f in $$(find automation -name '*.yaml'); do \
-		echo "  Checking $$f..."; \
-		python3 -c "\
-import yaml, sys; \
-data = yaml.safe_load(open('$$f')); \
-bp = data.get('blueprint', {}); \
-assert 'name' in bp, 'Missing name'; \
-assert 'domain' in bp, 'Missing domain'; \
-assert 'input' in bp, 'Missing input'; \
-assert 'source_url' in bp, 'Missing source_url'; \
-print(f'  ✓ {bp[\"name\"]}'); \
-" || exit 1; \
-	done
+	@python3 tools/validate_blueprints.py
 	@echo "✅ All blueprints valid"
 
 deploy:
